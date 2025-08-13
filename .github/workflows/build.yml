@@ -6,9 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  # <— hier liegt dein Sketch
-  SKETCH_PATH: firmware
-  # Board für ESP32-S2 Dev Module
+  SKETCH_PATH: firmware/firmware.ino   # <— anpassen, falls dein Sketch z.B. firmware/scope.ino heißt
   FQBN: esp32:esp32:esp32s2
 
 jobs:
@@ -17,27 +15,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Arduino CLI bereitstellen
       - uses: arduino/setup-arduino-cli@v1
+        with:
+          version: latest
+          additional-urls: https://espressif.github.io/arduino-esp32/package_esp32_index.json
 
+      # ESP32-Core installieren
       - name: Install ESP32 core
         run: |
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32
+          arduino-cli core install esp32:esp32@3.3.0
 
+      # benötigte Libraries installieren
       - name: Install libraries
         run: |
+          arduino-cli lib install "AsyncTCP"
+          arduino-cli lib install "ESP Async WebServer"
+          arduino-cli lib install "ElegantOTA"
           arduino-cli lib install "Adafruit GFX Library"
-          arduino-cli lib install "Adafruit ST7735 and ST7789 Library"
           arduino-cli lib install "Adafruit BusIO"
+          arduino-cli lib install "Adafruit ST7735 and ST7789 Library"
 
+      # Kompilieren
       - name: Compile
         run: |
           mkdir -p build
           arduino-cli compile \
-            --fqbn "${{ env.FQBN }}" \
-            --output-dir build \
-            "${{ env.SKETCH_PATH }}"
+            --fqbn $FQBN \
+            --build-path build \
+            "$SKETCH_PATH"
 
+      # .bin als Artifact bereitstellen
       - name: Upload artifact (.bin)
         uses: actions/upload-artifact@v4
         with:
