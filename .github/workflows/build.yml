@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  SKETCH_PATH: firmware/firmware.ino     # ggf. anpassen (Pfad/Name deines .ino)
+  SKETCH_PATH: firmware/scope.ino  # Pfad/Name deines Sketches
   FQBN: esp32:esp32:esp32s2
 
 jobs:
@@ -15,17 +15,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- Arduino CLI manuell installieren (ohne die GitHub-Action) ---
       - name: Install Arduino CLI
         run: |
           set -e
           VER=0.35.2
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s $VER
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+          mkdir -p $HOME/.local/bin
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=$HOME/.local/bin sh -s $VER
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
           arduino-cli version
 
-      # ESP32 Core Quelle + Installation
       - name: Install ESP32 core
         run: |
           arduino-cli config init
-          arduino-cli config add board_manager.additional_urls https://espressif.github.io/
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.0
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "AsyncTCP"
+          arduino-cli lib install "ESP Async WebServer"
+          arduino-cli lib install "ElegantOTA"
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install "Adafruit BusIO"
+          arduino-cli lib install "Adafruit ST7735 and ST7789 Library"
+
+      - name: Compile
+        run: |
+          mkdir -p build
+          arduino-cli compile \
+            --fqbn "$FQBN" \
+            --build-path build \
+            "$SKETCH_PATH"
+
+      - name: Upload artifact (.bin)
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: build/*.bin
