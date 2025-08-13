@@ -16,21 +16,27 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Arduino CLI manually
+      - name: Install Arduino CLI (manual)
+        shell: bash
         run: |
+          set -e
           curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz | tar -xz
           sudo mv arduino-cli /usr/local/bin/
           arduino-cli version
 
       - name: Install ESP32 core
+        shell: bash
         run: |
+          set -e
           arduino-cli config init
           arduino-cli config set board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.0
 
       - name: Install libraries
+        shell: bash
         run: |
+          set -e
           arduino-cli lib install "AsyncTCP"
           arduino-cli lib install "ESP Async WebServer"
           arduino-cli lib install "ElegantOTA"
@@ -39,15 +45,24 @@ jobs:
           arduino-cli lib install "Adafruit ST7735 and ST7789 Library"
 
       - name: Compile all .ino sketches
+        shell: bash
         run: |
           set -e
           mkdir -p build
           while IFS= read -r SKETCH; do
             echo "==> Compiling: $SKETCH"
             BN=$(basename "$SKETCH" .ino)
-            OUTDIR="build/${BN}"
+            OUTDIR="build/$BN"
             mkdir -p "$OUTDIR"
             arduino-cli compile --fqbn "$FQBN" --output-dir "$OUTDIR" "$SKETCH"
           done < <(find . -type f -name "*.ino")
 
-      - name:
+      - name: Upload firmware artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            build/**/*.bin
+            build/**/*.elf
+          if-no-files-found: warn
