@@ -1,0 +1,35 @@
+name: Build ESP32-S2 firmware
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  SKETCH_PATH: firmware/scope.ino
+  FQBN: esp32:esp32:esp32s2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v1
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "ESP Async WebServer"
+          arduino-cli lib install "AsyncTCP"
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install "Adafruit ST7735 and ST7789 Library"
+      - name: Compile
+        run: |
+          mkdir -p build
+          arduino-cli compile --fqbn $FQBN --output-dir build "$SKETCH_PATH"
+      - name: Upload artifact (.bin)
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: build/*.bin
