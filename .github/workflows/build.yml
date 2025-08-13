@@ -7,7 +7,7 @@ on:
 
 env:
   # <— hier liegt dein Sketch
-  SKETCH_PATH: firmware/scope.ino
+  SKETCH_PATH: firmware
   # Board für ESP32-S2 Dev Module
   FQBN: esp32:esp32:esp32s2
 
