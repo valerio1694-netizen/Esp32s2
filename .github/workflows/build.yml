@@ -6,62 +6,57 @@ on:
   workflow_dispatch:
 
 env:
+  # ESP32-S2 FQBN
   FQBN: esp32:esp32:esp32s2
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Arduino CLI (manual)
-        shell: bash
-        run: |
-          set -e
-          curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz | tar -xz
-          sudo mv arduino-cli /usr/local/bin/
-          arduino-cli version
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
+        with:
+          version: latest
 
-      - name: Install ESP32 core
-        shell: bash
+      - name: Add ESP32 package index & update
         run: |
-          set -e
           arduino-cli config init
-          arduino-cli config set board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@3.3.0
 
-      - name: Install libraries
-        shell: bash
+      - name: Install ESP32 core (2.0.17)
         run: |
-          set -e
-          arduino-cli lib install "AsyncTCP"
-          arduino-cli lib install "ESP Async WebServer"
-          arduino-cli lib install "ElegantOTA"
-          arduino-cli lib install "Adafruit GFX Library"
-          arduino-cli lib install "Adafruit BusIO"
-          arduino-cli lib install "Adafruit ST7735 and ST7789 Library"
+          arduino-cli core install esp32:esp32@2.0.17
+          arduino-cli core list
+
+      - name: Install libraries (fixed versions)
+        run: |
+          arduino-cli lib install "AsyncTCP@1.1.4"
+          arduino-cli lib install "ESP Async WebServer@3.8.0"
+          arduino-cli lib install "Adafruit GFX Library@1.12.1"
+          arduino-cli lib install "Adafruit BusIO@1.17.2"
+          arduino-cli lib install "Adafruit ST7735 and ST7789 Library@1.11.0"
 
       - name: Compile all .ino sketches
-        shell: bash
         run: |
           set -e
           mkdir -p build
-          while IFS= read -r SKETCH; do
-            echo "==> Compiling: $SKETCH"
-            BN=$(basename "$SKETCH" .ino)
-            OUTDIR="build/$BN"
-            mkdir -p "$OUTDIR"
-            arduino-cli compile --fqbn "$FQBN" --output-dir "$OUTDIR" "$SKETCH"
-          done < <(find . -type f -name "*.ino")
+          shopt -s nullglob
+          for ino in $(find firmware -type f -name "*.ino"); do
+            base=$(basename "$ino" .ino)
+            out="build/$base"
+            mkdir -p "$out"
+            echo "==> Compiling: $ino"
+            arduino-cli compile --fqbn "${FQBN}" --output-dir "$out" "$ino"
+          done
 
       - name: Upload firmware artifacts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: firmware
+          name: firmware-binaries
           path: |
             build/**/*.bin
             build/**/*.elf
