@@ -6,21 +6,26 @@ on:
   workflow_dispatch:
 
 env:
-  SKETCH_PATH: firmware/scope.ino  # Pfad/Name deines Sketches
+  # Pfad zu deinem Sketch im Repo
+  SKETCH_PATH: firmware/scope.ino
+  # Board (ESP32-S2)
   FQBN: esp32:esp32:esp32s2
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Install Arduino CLI
         run: |
           set -e
           VER=0.35.2
           mkdir -p $HOME/.local/bin
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=$HOME/.local/bin sh -s $VER
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+            | BINDIR=$HOME/.local/bin sh -s $VER
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           arduino-cli version
 
@@ -36,20 +41,4 @@ jobs:
           arduino-cli lib install "AsyncTCP"
           arduino-cli lib install "ESP Async WebServer"
           arduino-cli lib install "ElegantOTA"
-          arduino-cli lib install "Adafruit GFX Library"
-          arduino-cli lib install "Adafruit BusIO"
-          arduino-cli lib install "Adafruit ST7735 and ST7789 Library"
-
-      - name: Compile
-        run: |
-          mkdir -p build
-          arduino-cli compile \
-            --fqbn "$FQBN" \
-            --build-path build \
-            "$SKETCH_PATH"
-
-      - name: Upload artifact (.bin)
-        uses: actions/upload-artifact@v4
-        with:
-          name: firmware
-          path: build/*.bin
+          arduino-cli lib install "Adafruit GFX
