@@ -6,20 +6,26 @@ on:
   workflow_dispatch:
 
 env:
-  # ESP32-S2 FQBN
   FQBN: esp32:esp32:esp32s2
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Arduino CLI
-        uses: arduino/setup-arduino-cli@v1
-        with:
-          version: latest
+      # Arduino CLI manuell installieren (ohne Actions)
+      - name: Install Arduino CLI
+        run: |
+          set -e
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_0.35.2_Linux_64bit.tar.gz -o /tmp/arduino-cli.tar.gz
+          tar -xzf /tmp/arduino-cli.tar.gz -C /tmp
+          install /tmp/arduino-cli "$HOME/.local/bin/arduino-cli"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          arduino-cli version
 
       - name: Add ESP32 package index & update
         run: |
@@ -27,37 +33,27 @@ jobs:
           arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
 
-      - name: Install ESP32 core (2.0.17)
+      # Bewährte Kombi für AsyncWebServer mit S2
+      - name: Install ESP32 core 2.0.17
         run: |
           arduino-cli core install esp32:esp32@2.0.17
           arduino-cli core list
 
       - name: Install libraries (fixed versions)
         run: |
-          arduino-cli lib install "AsyncTCP@1.1.4"
-          arduino-cli lib install "ESP Async WebServer@3.8.0"
+          # Async-Stack passend zum Core 2.0.17
+          arduino-cli lib install "AsyncTCP@1.1.1"
+          arduino-cli lib install "ESP Async WebServer@1.2.3"
+          # Display
           arduino-cli lib install "Adafruit GFX Library@1.12.1"
           arduino-cli lib install "Adafruit BusIO@1.17.2"
           arduino-cli lib install "Adafruit ST7735 and ST7789 Library@1.11.0"
 
       - name: Compile all .ino sketches
+        shell: bash
         run: |
           set -e
-          mkdir -p build
           shopt -s nullglob
-          for ino in $(find firmware -type f -name "*.ino"); do
-            base=$(basename "$ino" .ino)
-            out="build/$base"
-            mkdir -p "$out"
-            echo "==> Compiling: $ino"
-            arduino-cli compile --fqbn "${FQBN}" --output-dir "$out" "$ino"
-          done
-
-      - name: Upload firmware artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: firmware-binaries
-          path: |
-            build/**/*.bin
-            build/**/*.elf
-          if-no-files-found: warn
+          mkdir -p build
+          # alle .ino in firmware/ finden und bauen
+          map
