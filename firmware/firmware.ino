@@ -1,12 +1,12 @@
 /*
   ESP32-S2 Bildrahmen / Slideshow (Projekt 8)
-  - Display: ST7735 160x128, Rotation = 1
-  - Deine Pins: CS=5, RST=6, DC=7, MOSI=11, SCLK=12, LED=13 (PWM-Dimmen)
-  - JPG + PNG aus SPIFFS (/img)
-  - Web-UI: Upload (jpg/png), Liste, Autoplay/Intervall/Fade, Helligkeit-Slider, OTA-Update
-  - Echtes Crossfade (RGB565 Blend, 2 Framebuffer)
-  - Demo-Animation solange kein Intervall gesetzt ist
-  - Für ESP32 Core 2.0.17 + Adafruit/Async/TJpg/PNGdec (siehe Workflow)
+  - ST7735 160x128, Rotation = 1
+  - Pins: CS=5, RST=6, DC=7, MOSI=11, SCLK=12, LED=13 (PWM-Dimmen)
+  - JPG + PNG aus SPIFFS(/img)
+  - Web-UI: Upload, Liste, Autoplay/Intervall/Fade, Helligkeits-Slider, OTA
+  - Echtes Crossfade: zeilenweise Blend (kein 3. Vollpuffer nötig)
+  - Große Puffer jetzt dynamisch (heap_caps_malloc) → kein .bss Overflow
+  - Getestet mit ESP32 Core 2.0.17 + Adafruit/Async/TJpg/PNGdec
 */
 
 #include <Arduino.h>
@@ -24,19 +24,20 @@
 #include <TJpg_Decoder.h>
 #include <PNGdec.h>
 #include <algorithm>
+#include <esp_heap_caps.h>   // heap_caps_malloc
 
-// -------------------- TFT-Pins (dein Setup) --------------------
+// -------------------- TFT-Pins --------------------
 #define TFT_CS    5
 #define TFT_RST   6
 #define TFT_DC    7
 #define TFT_MOSI 11
 #define TFT_SCLK 12
-#define TFT_LED  13   // Backlight (PWM über LEDC)
+#define TFT_LED  13   // Backlight (PWM via LEDC)
 
 static const int TFT_W = 160;
 static const int TFT_H = 128;
 
-// Software-SPI Konstruktor (nutzt explizit MOSI/SCLK Pins)
+// Software-SPI (MOSI/SCLK wie oben)
 Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
 // -------------------- Backlight / LEDC -------------------------
@@ -59,14 +60,13 @@ const char* AP_PASS  = "12345678";
 AsyncWebServer server(80);
 
 // -------------------- Slideshow/Buffer ------------------------
-static uint16_t fbA[TFT_W * TFT_H];
-static uint16_t fbB[TFT_W * TFT_H];
-static uint16_t* fbCurr = fbA;
-static uint16_t* fbNext = fbB;
+// Framebuffer **dynamisch** (Heap), um .bss zu entlasten
+static uint16_t* fbCurr = nullptr;
+static uint16_t* fbNext = nullptr;
 
-bool autoplay = false;       // wird true, wenn intervalMs > 0 gesetzt wird
-long intervalMs = 0;         // 0 = Demo-Mode
-long fadeMs     = 600;       // Crossfade-Dauer in ms
+bool autoplay = false;       // true, wenn intervalMs > 0
+long intervalMs = 0;         // 0 = Demo
+long fadeMs     = 600;       // Crossfade ms
 unsigned long lastSwitch = 0;
 int currentIndex = -1;
 
@@ -75,7 +75,7 @@ int imageCount = 0;
 
 uint8_t brightness = 255;    // 0..255
 
-// -------------------- Decoder-Instanzen -----------------------
+// -------------------- Decoder -----------------------
 PNG png;
 
 // Ziel-Kontext für JPG-Callback
@@ -94,30 +94,36 @@ static void clearFB(uint16_t* fb, uint16_t color = 0x0000) {
   for (int i = 0; i < TFT_W * TFT_H; ++i) fb[i] = color;
 }
 
+// Zeilenweises Crossfade -> nur kleiner Line-Buffer nötig
 static void crossfade(uint8_t alpha /*0..255*/) {
-  for (int i = 0; i < TFT_W * TFT_H; ++i) {
-    uint16_t c0 = fbCurr[i];
-    uint16_t c1 = fbNext[i];
+  static uint16_t mixLine[TFT_W];
+  for (int y = 0; y < TFT_H; ++y) {
+    uint16_t* row0 = fbCurr + y * TFT_W;
+    uint16_t* row1 = fbNext + y * TFT_W;
+    for (int x = 0; x < TFT_W; ++x) {
+      uint16_t c0 = row0[x];
+      uint16_t c1 = row1[x];
 
-    uint16_t r0 = (c0 >> 11) & 0x1F;
-    uint16_t g0 = (c0 >> 5)  & 0x3F;
-    uint16_t b0 =  c0        & 0x1F;
+      uint16_t r0 = (c0 >> 11) & 0x1F;
+      uint16_t g0 = (c0 >> 5)  & 0x3F;
+      uint16_t b0 =  c0        & 0x1F;
 
-    uint16_t r1 = (c1 >> 11) & 0x1F;
-    uint16_t g1 = (c1 >> 5)  & 0x3F;
-    uint16_t b1 =  c1        & 0x1F;
+      uint16_t r1 = (c1 >> 11) & 0x1F;
+      uint16_t g1 = (c1 >> 5)  & 0x3F;
+      uint16_t b1 =  c1        & 0x1F;
 
-    uint16_t r = ( ((r0 * (255 - alpha)) + (r1 * alpha)) >> 8 );
-    uint16_t g = ( ((g0 * (255 - alpha)) + (g1 * alpha)) >> 8 );
-    uint16_t b = ( ((b0 * (255 - alpha)) + (b1 * alpha)) >> 8 );
+      uint16_t r = ( ((r0 * (255 - alpha)) + (r1 * alpha)) >> 8 );
+      uint16_t g = ( ((g0 * (255 - alpha)) + (g1 * alpha)) >> 8 );
+      uint16_t b = ( ((b0 * (255 - alpha)) + (b1 * alpha)) >> 8 );
 
-    fbA[i] = (r << 11) | (g << 5) | b;   // mix in fbA als Ausgabepuffer
+      mixLine[x] = (r << 11) | (g << 5) | b;
+    }
+    tft.drawRGBBitmap(0, y, mixLine, TFT_W, 1);
   }
-  blitFull(fbA);
 }
 
 // ================= JPG (TJpg_Decoder) =========================
-// Korrekte Signatur für v1.1.0 (w/h als uint16_t!)
+// Korrekte Signatur für v1.1.0 (w/h als uint16_t)
 static bool jpgToBuffer(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
   int dstW = jpgCtx.dstW, dstH = jpgCtx.dstH;
   int ox = jpgCtx.ox, oy = jpgCtx.oy;
@@ -177,10 +183,9 @@ static int32_t pngSeek(PNGFILE* file, int32_t pos) {
 }
 
 // Draw-Callback: liefert eine Zeile als RGB565.
-// Achtung: PNGdec 1.1.4 hat kein pDraw->x; wir gehen von x=0 aus.
+// PNGdec 1.1.4 hat kein pDraw->x -> wir beginnen bei x=0.
 static int pngDraw(PNGDRAW* pDraw) {
   static uint16_t line[TFT_W];
-  // BIG_ENDIAN passt zu Adafruit drawRGBBitmap
   png.getLineAsRGB565(pDraw, line, PNG_RGB565_BIG_ENDIAN, 0xFFFF);
 
   int y = pDraw->y;
@@ -189,8 +194,7 @@ static int pngDraw(PNGDRAW* pDraw) {
   int w = pDraw->iWidth;
   if (w > TFT_W) w = TFT_W;
 
-  // Wir beginnen links bei 0 (kein Offset-Feld vorhanden)
-  memcpy(&fbNext[y * TFT_W + 0], line, w * 2);
+  memcpy(&fbNext[y * TFT_W], line, w * 2);
   return 1;
 }
 
@@ -241,7 +245,8 @@ static String listJSON() {
 
 // ================= Demo-Animation =============================
 static void renderDemoFrame(float phase) {
-  clearFB(fbNext, 0x0000);
+  // einfache Sinus-Linie
+  memset(fbNext, 0, TFT_W * TFT_H * 2);
   for (int x = 0; x < TFT_W; ++x) {
     float t = (x / 20.0f) + phase;
     int y = (int)((sinf(t) * 0.4f + 0.5f) * (TFT_H - 1));
@@ -412,14 +417,24 @@ void setup() {
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
   tft.fillScreen(ST77XX_BLACK);
-  setBacklight(brightness);   // Backlight an
+  setBacklight(brightness);
 
   // FS
   SPIFFS.begin(true);
   SPIFFS.mkdir("/img");
 
+  // Framebuffer dynamisch anfordern (8-Bit fähiger Heap)
+  fbCurr = (uint16_t*) heap_caps_malloc(TFT_W * TFT_H * 2, MALLOC_CAP_8BIT);
+  fbNext = (uint16_t*) heap_caps_malloc(TFT_W * TFT_H * 2, MALLOC_CAP_8BIT);
+  if (!fbCurr || !fbNext) {
+    // Minimalfall: mit einer Pufferfläche weiter (kein Crossfade)
+    if (!fbCurr) fbCurr = (uint16_t*) heap_caps_malloc(TFT_W * TFT_H * 2, MALLOC_CAP_8BIT);
+    if (!fbCurr) { while (1) { Serial.println("RAM-Allocation failed"); delay(1000);} }
+    fbNext = fbCurr; // Crossfade später intern überspringen
+  }
+
   // Decoder-Init
-  TJpgDec.setSwapBytes(true); // wichtig auf ESP32
+  TJpgDec.setSwapBytes(true);
 
   // Netzwerk + Web
   wifiStart();
@@ -439,16 +454,21 @@ void loop() {
     renderDemoFrame(demoPhase);
     demoPhase += 0.08f;
 
-    // kurzer Übergang zwischen Demo-Frames
-    std::swap(fbCurr, fbNext);
-    unsigned long t0 = millis();
-    while (millis() - t0 < 100) {
-      uint8_t a = (uint8_t)(((millis() - t0) * 255) / 100);
-      if (a > 255) a = 255;
-      crossfade(a);
-      delay(10);
+    // kurzer Übergang zwischen Demo-Frames (wenn 2 Puffer vorhanden)
+    if (fbNext != fbCurr) {
+      // fbCurr = alt, fbNext = neu (already prepared)
+      // zeilenweiser Crossfade ~100ms
+      unsigned long t0 = millis();
+      while (millis() - t0 < 100) {
+        uint8_t a = (uint8_t)(((millis() - t0) * 255) / 100);
+        if (a > 255) a = 255;
+        crossfade(a);
+        delay(10);
+      }
     }
     blitFull(fbNext);
+    // tausche Rolle (nur wenn 2 Puffer)
+    if (fbNext != fbCurr) std::swap(fbCurr, fbNext);
     delay(60);
     return;
   }
@@ -462,20 +482,25 @@ void loop() {
     bool ok = renderImageToNext(path);
     if (!ok) return;
 
-    // Crossfade
-    std::swap(fbCurr, fbNext); // fbCurr = alt, fbNext = neu
-    unsigned long t0 = millis();
-    unsigned long dur = (unsigned long)std::max<long>(0, fadeMs);
-    if (dur == 0) {
-      blitFull(fbNext);
-    } else {
-      while (millis() - t0 < dur) {
-        uint8_t a = (uint8_t)(((millis() - t0) * 255) / dur);
-        if (a > 255) a = 255;
-        crossfade(a);
-        delay(10);
+    // Crossfade (nur wenn 2 Puffer existieren)
+    if (fbNext != fbCurr) {
+      unsigned long t0 = millis();
+      unsigned long dur = (unsigned long)std::max<long>(0, fadeMs);
+      if (dur == 0) {
+        blitFull(fbNext);
+      } else {
+        while (millis() - t0 < dur) {
+          uint8_t a = (uint8_t)(((millis() - t0) * 255) / dur);
+          if (a > 255) a = 255;
+          crossfade(a);
+          delay(10);
+        }
+        blitFull(fbNext);
       }
-      blitFull(fbNext);
+      std::swap(fbCurr, fbNext);
+    } else {
+      // nur ein Puffer: direkt zeichnen
+      blitFull(fbCurr);
     }
   }
 
