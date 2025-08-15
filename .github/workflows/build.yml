@@ -18,32 +18,37 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # -------- Arduino CLI (gepinnt – Fix für 'unable to get latest version') --------
-      - name: Setup Arduino CLI
-        uses: arduino/setup-arduino-cli@v1
-        with:
-          version: 0.35.2   # <- bewusst gepinnt, stabil auf GH runners
+      # ---- Arduino CLI ohne Action-Wrapper (Fix für 'unable to get latest version') ----
+      - name: Install Arduino CLI (pinned)
+        shell: bash
+        run: |
+          set -e
+          VER=0.35.2
+          curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_${VER}_Linux_64bit.tar.gz" \
+            | tar -xz
+          sudo mv arduino-cli /usr/local/bin/arduino-cli
+          arduino-cli version
 
-      # -------- Cache: Core & Libs beschleunigen --------
+      # ---- Cache: Core & Libs ----
       - name: Cache Arduino core & packages
         uses: actions/cache@v4
         with:
           path: |
             ~/.arduino15
             ~/Arduino/hardware
-          key: arduino-core-${{ runner.os }}-v2-${{ hashFiles('**/build.yml') }}
+          key: arduino-core-${{ runner.os }}-v2-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: Cache Arduino libraries
         uses: actions/cache@v4
         with:
           path: |
             ~/Arduino/libraries
-          key: arduino-libs-${{ runner.os }}-v3-${{ hashFiles('**/firmware/**/*.ino') }}
+          key: arduino-libs-${{ runner.os }}-v3-${{ hashFiles('firmware/**/*.ino') }}
           restore-keys: |
             arduino-libs-${{ runner.os }}-v3-
 
-      # -------- ESP32 Core 2.0.17 installieren --------
-      - name: Add ESP32 package index & core update
+      # ---- ESP32 Core installieren ----
+      - name: Add ESP32 package index & update
         run: |
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
@@ -54,8 +59,8 @@ jobs:
           arduino-cli core install esp32:esp32@2.0.17
           arduino-cli board listall | grep -i esp32 || true
 
-      # -------- Bibliotheken (fixe/pin-kompatible Versionen) --------
-      - name: Install libraries (fixed, incl. TJpg_Decoder + PNGdec)
+      # ---- Bibliotheken (inkl. TJpg_Decoder + PNGdec) ----
+      - name: Install libraries (fixed set)
         run: |
           set -e
           # Netzwerk/OTA
@@ -71,11 +76,11 @@ jobs:
           arduino-cli lib install "Adafruit BusIO@1.17.2"
           arduino-cli lib install "SPI"
           arduino-cli lib install "Wire"
-          # Bilddecoder
+          # Decoder
           arduino-cli lib install "TJpg_Decoder"
           arduino-cli lib install "PNGdec"
 
-      # -------- Kompilieren: alle Sketches in firmware/ --------
+      # ---- Kompilieren aller .ino in firmware/ ----
       - name: Compile sketches in firmware/
         shell: bash
         run: |
@@ -94,7 +99,7 @@ jobs:
               "$ino"
           done
 
-      # -------- Artefakte hochladen --------
+      # ---- Artefakte hochladen ----
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
