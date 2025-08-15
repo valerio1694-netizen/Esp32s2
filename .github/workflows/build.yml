@@ -12,17 +12,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---- Arduino CLI zuverlässig installieren (ohne setup-Action) ----
-      - name: Install Arduino CLI
+      # -------- Arduino CLI zuverlässig installieren --------
+      - name: Install Arduino CLI (0.35.2)
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          VER="0.35.2"
           mkdir -p "$HOME/.local/bin"
-          curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz \
-            | tar xz -C "$HOME/.local/bin" --strip-components=1 arduino-cli
+          TMP="$(mktemp -d)"
+          cd "$TMP"
+          curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_${VER}_Linux_64bit.tar.gz" -o cli.tgz
+          tar -xzf cli.tgz
+          install -m 755 arduino-cli_*/arduino-cli "$HOME/.local/bin/arduino-cli"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          arduino-cli version
+          # In DIESEM Step noch mit vollem Pfad testen:
+          "$HOME/.local/bin/arduino-cli" version
 
-      # ---- Cache für Core, Pakete & Bibliotheken ----
+      # -------- Cache für Core, Pakete & Libraries --------
       - name: Cache Arduino core & packages
         uses: actions/cache@v4
         with:
@@ -33,20 +39,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-arduino-
 
-      # ---- ESP32 Core einbinden & installieren (2.0.17) ----
+      # -------- ESP32 Core 2.0.17 installieren --------
       - name: Add ESP32 package index & core update
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           arduino-cli config init --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@2.0.17
           arduino-cli core list
 
-      # ---- Bibliotheken installieren (externe) ----
-      # WICHTIG: 'Update' NICHT installieren – kommt aus dem ESP32-Core.
+      # -------- Benötigte Libraries installieren --------
+      # WICHTIG: 'Update' NICHT installieren – gehört zum ESP32-Core.
       - name: Install libraries (fixed set incl. TJpg_Decoder + PNGdec)
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           arduino-cli lib install "AsyncTCP@1.1.1"
           arduino-cli lib install "ESP Async WebServer@3.6.0"
           arduino-cli lib install "Adafruit GFX Library@1.12.1"
@@ -55,14 +63,15 @@ jobs:
           arduino-cli lib install "PNGdec"
           arduino-cli lib list
 
-      # ---- Kompilieren: alle .ino in firmware/ ----
+      # -------- Kompilieren: alle .ino in ./firmware --------
       - name: Compile sketches in firmware/
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p build
           shopt -s nullglob
           for ino in firmware/*.ino; do
-            bn=$(basename "$ino" .ino)
+            bn="$(basename "$ino" .ino)"
             echo "==> Compiling: $ino"
             arduino-cli compile \
               --fqbn esp32:esp32:esp32s2 \
@@ -71,7 +80,7 @@ jobs:
               "$ino"
           done
 
-      # ---- Artefakte hochladen (.bin / .elf) ----
+      # -------- Artefakte hochladen --------
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
