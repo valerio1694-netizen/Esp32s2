@@ -1,105 +1,103 @@
-name: build
+name: Build ESP32-S2 (firmware folder)
 
 on:
   push:
+    branches: [ main ]
   pull_request:
   workflow_dispatch:
-
-env:
-  # -> Falls du ein anderes Board nutzen willst, hier die FQBN anpassen.
-  # Für ESP32-S2: "esp32:esp32:esp32s2"
-  BOARD_FQBN: esp32:esp32:esp32s2
-  ESP32_CORE_VERSION: 2.0.17
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      FQBN: esp32:esp32:esp32s2
+      ESP32_CORE_VERSION: 2.0.17
+      ARDUINO_CLI_VERSION: 0.35.2
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------- Arduino CLI installieren ----------
-      - name: Install Arduino CLI
-        run: |
-          set -e
-          curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz -o /tmp/arduino-cli.tar.gz
-          tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin
-          arduino-cli version
-      - name: Show git version (debug)
-        run: git --version
+      # --- Arduino CLI installieren (fixe Version) ---
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
+        with:
+          version: ${{ env.ARDUINO_CLI_VERSION }}
 
-      # ---------- Caches für schnellere Builds ----------
+      # --- Cache für Core/Packages ---
       - name: Cache Arduino core & packages
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.arduino15
-          key: arduino15-${{ env.ESP32_CORE_VERSION }}
+          path: ~/.arduino15
+          key: arduino15-${{ runner.os }}-${{ env.ESP32_CORE_VERSION }}
+
+      # --- Cache für Libraries ---
       - name: Cache Arduino libraries
         uses: actions/cache@v4
         with:
-          path: |
-            ~/Arduino/libraries
-          key: arduinolibs-${{ hashFiles('**/*.ino', 'library.lock') }}
+          path: ~/Arduino/libraries
+          key: arduinolibs-${{ runner.os }}-v3
 
-      # ---------- ESP32 Core 2.0.17 installieren ----------
-      - name: Add ESP32 package index & update
-        run: |
-          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-      - name: Install ESP32 core (${{ env.ESP32_CORE_VERSION }})
-        run: |
-          arduino-cli core install esp32:esp32@${{ env.ESP32_CORE_VERSION }} \
-            --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-          arduino-cli core list
-
-      # ---------- benötigte Libraries installieren ----------
-      # Versionen sind bewusst kompatibel mit Core 2.0.17 gewählt.
-      - name: Install libraries (fixed set incl. TJpg_Decoder)
+      # --- ESP32 Core installieren (2.0.17) ---
+      - name: Install ESP32 core
         run: |
           set -e
-          # Display/Adafruit
+          arduino-cli config init
+          arduino-cli config set board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
+          arduino-cli core list
+
+      # --- Libraries installieren (inkl. Async, JPG, PNG, JSON) ---
+      - name: Install libraries
+        run: |
+          set -e
+          # Display
           arduino-cli lib install "Adafruit GFX Library@1.12.1" || true
           arduino-cli lib install "Adafruit BusIO@1.17.2" || true
           arduino-cli lib install "Adafruit ST7735 and ST7789 Library@1.11.0" || true
-          # Netzwerk / OTA
-          arduino-cli lib install "WiFi@2.0.0" || true
-          arduino-cli lib install "AsyncTCP@3.3.2" || true
-          arduino-cli lib install "ESP Async WebServer@3.6.0" || true
-          arduino-cli lib install "Update@2.0.0" || true
-          # Dateisystem
+          # Core/FS/SPI
+          arduino-cli lib install "SPI@2.0.0" || true
           arduino-cli lib install "FS@2.0.0" || true
           arduino-cli lib install "SPIFFS@2.0.0" || true
-          # JPEG-Decoder (NEU)
+          # Netzwerk/Async/OTA
+          arduino-cli lib install "WiFi@2.0.0" || true
+          arduino-cli lib install "AsyncTCP@1.1.1" || true
+          arduino-cli lib install "ESP Async WebServer@3.6.0" || true
+          arduino-cli lib install "Update@2.0.0" || true
+          # Decoder
           arduino-cli lib install "TJpg_Decoder" || true
+          arduino-cli lib install "PNGdec" || true
+          # JSON
+          arduino-cli lib install "ArduinoJson@6.21.2" || true
 
-          echo "Libraries installed:"
+          echo "== Installed libraries =="
           arduino-cli lib list
 
-      # ---------- alle .ino unter ./firmware kompilieren ----------
-      - name: Compile all .ino sketches
+      # --- Alle .ino unter firmware/ kompilieren ---
+      - name: Compile sketches in firmware/
         run: |
           set -e
-          mkdir -p build
           shopt -s nullglob
-          sketches=( $(find ./firmware -maxdepth 2 -type f -name "*.ino") )
+          mapfile -t SKETCHES < <(find firmware -type f -name "*.ino" | sort)
           echo "Gefundene Sketche:"
-          printf " - %s\n" "${sketches[@]}"
-          for sketch in "${sketches[@]}"; do
-            name="$(basename "${sketch%.*}")"
-            outdir="build/${name}"
-            mkdir -p "${outdir}"
-            echo "==> Compiling: ${sketch}"
+          printf " - %s\n" "${SKETCHES[@]}"
+          mkdir -p build
+          for SKETCH in "${SKETCHES[@]}"; do
+            NAME=$(basename "${SKETCH%.*}")
+            OUTDIR="build/${NAME}"
+            mkdir -p "${OUTDIR}"
+            echo "==> Compiling: ${SKETCH}"
             arduino-cli compile \
-              --fqbn $BOARD_FQBN \
+              --fqbn "${FQBN}" \
               --warnings default \
-              --build-path "${outdir}" \
-              --output-dir "${outdir}" \
-              "${sketch}"
-            echo "==> Done: ${sketch}"
+              --export-binaries \
+              --output-dir "${OUTDIR}" \
+              "${SKETCH}"
           done
 
-      # ---------- Artefakte hochladen (.bin / .elf) ----------
+      # --- Artefakte hochladen (.bin/.elf) ---
       - name: Upload firmware artifacts
         if: always()
         uses: actions/upload-artifact@v4
