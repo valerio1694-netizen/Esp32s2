@@ -1,105 +1,109 @@
-name: Build ESP32-S2 (firmware folder)
+name: build
 
 on:
   push:
     branches: [ main ]
   pull_request:
-  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
-    env:
-      FQBN: esp32:esp32:esp32s2
-      ESP32_CORE_VERSION: 2.0.17
-      ARDUINO_CLI_VERSION: 0.35.2
-
     steps:
+      - name: Set up job
+        run: echo "Starting ESP32 build…"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --- Arduino CLI installieren (fixe Version) ---
+      # Feste CLI-Version (Fix für 'unable to get latest version')
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v1
         with:
-          version: ${{ env.ARDUINO_CLI_VERSION }}
+          version: 0.35.2
 
-      # --- Cache für Core/Packages ---
       - name: Cache Arduino core & packages
         uses: actions/cache@v4
         with:
-          path: ~/.arduino15
-          key: arduino15-${{ runner.os }}-${{ env.ESP32_CORE_VERSION }}
+          path: |
+            ~/.arduino15
+          key: ${{ runner.os }}-arduino-core-${{ hashFiles('**/build.yml') }}
+          restore-keys: ${{ runner.os }}-arduino-core-
 
-      # --- Cache für Libraries ---
       - name: Cache Arduino libraries
         uses: actions/cache@v4
         with:
-          path: ~/Arduino/libraries
-          key: arduinolibs-${{ runner.os }}-v3
+          path: |
+            ~/Arduino/libraries
+          key: ${{ runner.os }}-arduino-libs-${{ hashFiles('**/firmware/**') }}
+          restore-keys: ${{ runner.os }}-arduino-libs-
 
-      # --- ESP32 Core installieren (2.0.17) ---
-      - name: Install ESP32 core
+      - name: Add ESP32 package index & core update
         run: |
-          set -e
           arduino-cli config init
           arduino-cli config set board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
+
+      - name: Install ESP32 core (2.0.17)
+        run: |
+          arduino-cli core install esp32:esp32@2.0.17
           arduino-cli core list
 
-      # --- Libraries installieren (inkl. Async, JPG, PNG, JSON) ---
-      - name: Install libraries
+      - name: Install libraries (fixed, inkl. TJpg_Decoder + PNGdec)
         run: |
-          set -e
-          # Display
-          arduino-cli lib install "Adafruit GFX Library@1.12.1" || true
-          arduino-cli lib install "Adafruit BusIO@1.17.2" || true
-          arduino-cli lib install "Adafruit ST7735 and ST7789 Library@1.11.0" || true
-          # Core/FS/SPI
-          arduino-cli lib install "SPI@2.0.0" || true
-          arduino-cli lib install "FS@2.0.0" || true
-          arduino-cli lib install "SPIFFS@2.0.0" || true
-          # Netzwerk/Async/OTA
-          arduino-cli lib install "WiFi@2.0.0" || true
-          arduino-cli lib install "AsyncTCP@1.1.1" || true
-          arduino-cli lib install "ESP Async WebServer@3.6.0" || true
-          arduino-cli lib install "Update@2.0.0" || true
-          # Decoder
-          arduino-cli lib install "TJpg_Decoder" || true
-          arduino-cli lib install "PNGdec" || true
-          # JSON
-          arduino-cli lib install "ArduinoJson@6.21.2" || true
+          # Display-Stack
+          arduino-cli lib install "Adafruit GFX Library@1.12.1"
+          arduino-cli lib install "Adafruit ST7735 and ST7789 Library@1.11.0"
+          arduino-cli lib install "Adafruit BusIO@1.17.2"
 
-          echo "== Installed libraries =="
+          # Async-Stack passend zu Core 2.0.17
+          arduino-cli lib install "AsyncTCP@1.1.1"
+          arduino-cli lib install "ESP Async WebServer@3.6.0"
+
+          # JPEG Decoder
+          if ! arduino-cli lib install "TJpg_Decoder" ; then
+            echo "TJpg_Decoder not in index, cloning from GitHub…"
+            mkdir -p ~/Arduino/libraries
+            cd ~/Arduino/libraries
+            if [ ! -d TJpg_Decoder ]; then
+              git clone --depth=1 https://github.com/Bodmer/TJpg_Decoder.git
+            fi
+          fi
+
+          # PNG Decoder
+          arduino-cli lib install "PNGdec" || true
+
+          # Optional/Standard
+          arduino-cli lib install "SPI" || true
+
           arduino-cli lib list
 
-      # --- Alle .ino unter firmware/ kompilieren ---
       - name: Compile sketches in firmware/
+        env:
+          FQBN: esp32:esp32:esp32s2
         run: |
           set -e
           shopt -s nullglob
-          mapfile -t SKETCHES < <(find firmware -type f -name "*.ino" | sort)
-          echo "Gefundene Sketche:"
-          printf " - %s\n" "${SKETCHES[@]}"
           mkdir -p build
-          for SKETCH in "${SKETCHES[@]}"; do
-            NAME=$(basename "${SKETCH%.*}")
-            OUTDIR="build/${NAME}"
-            mkdir -p "${OUTDIR}"
-            echo "==> Compiling: ${SKETCH}"
+          found=0
+          for ino in $(find firmware -maxdepth 2 -type f -name "*.ino"); do
+            found=1
+            name=$(basename "$(dirname "$ino")")
+            outdir="build/${name}"
+            echo "==> Compiling: ${ino}  ->  ${outdir}"
+            mkdir -p "${outdir}"
             arduino-cli compile \
               --fqbn "${FQBN}" \
               --warnings default \
+              --build-path "${outdir}" \
               --export-binaries \
-              --output-dir "${OUTDIR}" \
-              "${SKETCH}"
+              "${ino}"
           done
+          if [ $found -eq 0 ]; then
+            echo "No .ino files found under firmware/"; exit 1
+          fi
 
-      # --- Artefakte hochladen (.bin/.elf) ---
       - name: Upload firmware artifacts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: firmware-binaries
@@ -107,3 +111,6 @@ jobs:
             build/**/*.bin
             build/**/*.elf
           if-no-files-found: warn
+
+      - name: Complete job
+        run: echo "Build finished."
