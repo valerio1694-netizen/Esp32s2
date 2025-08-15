@@ -12,7 +12,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # -------- Arduino CLI zuverlässig installieren --------
+      # ---------- Arduino CLI stabil & robust installieren ----------
       - name: Install Arduino CLI (0.35.2)
         shell: bash
         run: |
@@ -23,12 +23,20 @@ jobs:
           cd "$TMP"
           curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_${VER}_Linux_64bit.tar.gz" -o cli.tgz
           tar -xzf cli.tgz
-          install -m 755 arduino-cli_*/arduino-cli "$HOME/.local/bin/arduino-cli"
+          # Binary finden (je nach Tarball-Layout)
+          BIN=""
+          if [[ -f "./arduino-cli" ]]; then
+            BIN="./arduino-cli"
+          elif [[ -f "./arduino-cli_${VER}_Linux_64bit/arduino-cli" ]]; then
+            BIN="./arduino-cli_${VER}_Linux_64bit/arduino-cli"
+          else
+            BIN="$(find . -type f -name arduino-cli | head -n1)"
+          fi
+          test -n "$BIN" && install -m 755 "$BIN" "$HOME/.local/bin/arduino-cli"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          # In DIESEM Step noch mit vollem Pfad testen:
           "$HOME/.local/bin/arduino-cli" version
 
-      # -------- Cache für Core, Pakete & Libraries --------
+      # ---------- Cache für Core, Pakete & Libraries ----------
       - name: Cache Arduino core & packages
         uses: actions/cache@v4
         with:
@@ -39,7 +47,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-arduino-
 
-      # -------- ESP32 Core 2.0.17 installieren --------
+      # ---------- ESP32 Core 2.0.17 ----------
       - name: Add ESP32 package index & core update
         shell: bash
         run: |
@@ -49,8 +57,7 @@ jobs:
           arduino-cli core install esp32:esp32@2.0.17
           arduino-cli core list
 
-      # -------- Benötigte Libraries installieren --------
-      # WICHTIG: 'Update' NICHT installieren – gehört zum ESP32-Core.
+      # ---------- Libraries (fixe Versionen, inkl. Decoder) ----------
       - name: Install libraries (fixed set incl. TJpg_Decoder + PNGdec)
         shell: bash
         run: |
@@ -63,7 +70,7 @@ jobs:
           arduino-cli lib install "PNGdec"
           arduino-cli lib list
 
-      # -------- Kompilieren: alle .ino in ./firmware --------
+      # ---------- Kompilieren: alle .ino in ./firmware ----------
       - name: Compile sketches in firmware/
         shell: bash
         run: |
@@ -80,7 +87,7 @@ jobs:
               "$ino"
           done
 
-      # -------- Artefakte hochladen --------
+      # ---------- Artefakte ----------
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
