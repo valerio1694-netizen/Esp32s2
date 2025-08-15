@@ -22,7 +22,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Arduino-CLI stabil & gepinnt (kein "unable to get latest version")
       - name: Install Arduino CLI (${{ env.CLI_VERSION }})
         run: |
           set -euxo pipefail
@@ -41,7 +40,6 @@ jobs:
           arduino-cli core install "${ESP32_CORE}"
           arduino-cli core list
 
-      # Benötigte Bibliotheken (pinned). Core-Libs (WiFi/FS/SPIFFS/Update) kommen mit dem ESP32-Core.
       - name: Install libraries (Adafruit + Async + Decoders)
         run: |
           set -euxo pipefail
