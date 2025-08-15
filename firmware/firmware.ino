@@ -5,7 +5,8 @@
   - JPG + PNG aus SPIFFS(/img)
   - Web-UI: Upload, Liste, Autoplay/Intervall/Fade, Helligkeits-Slider, OTA
   - Echtes Crossfade: zeilenweise Blend (kein 3. Vollpuffer nötig)
-  - Große Puffer jetzt dynamisch (heap_caps_malloc) → kein .bss Overflow
+  - Große Puffer dynamisch (heap_caps_malloc) → kein .bss Overflow
+  - AP läuft dauerhaft (AP+STA), SSID: ESP-Frame
   - Getestet mit ESP32 Core 2.0.17 + Adafruit/Async/TJpg/PNGdec
 */
 
@@ -53,14 +54,13 @@ static void setBacklight(uint8_t level) {
 
 // -------------------- Netzwerk -------------------------------
 const char* STA_SSID = "Peng";
-const char* STA_PASS = "";           // leer => AP-Fallback
+const char* STA_PASS = "";           // leer => es wird trotzdem AP gestartet (AP+STA)
 const char* AP_SSID  = "ESP-Frame";
 const char* AP_PASS  = "12345678";
 
 AsyncWebServer server(80);
 
 // -------------------- Slideshow/Buffer ------------------------
-// Framebuffer **dynamisch** (Heap), um .bss zu entlasten
 static uint16_t* fbCurr = nullptr;
 static uint16_t* fbNext = nullptr;
 
@@ -397,17 +397,30 @@ static void setupWeb() {
 }
 
 // -------------------- Setup / Loop ---------------------------
+// Neuer Start: AP läuft IMMER, STA wird parallel versucht.
+// AP bleibt aktiv – auch wenn STA verbindet.
 static void wifiStart() {
-  WiFi.mode(WIFI_STA);
-  if (strlen(STA_PASS)) WiFi.begin(STA_SSID, STA_PASS);
-  unsigned long t0 = millis();
-  while (strlen(STA_PASS) && WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(200);
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.persistent(false);       // nicht ins NVS schreiben
+  WiFi.disconnect(true, true);  // alte Verbindungen + Config aus RAM löschen
+  delay(100);
+
+  WiFi.mode(WIFI_AP_STA);
+
+  // AP immer starten (2.4 GHz, Kanal 1)
+  bool apOK = WiFi.softAP(AP_SSID, AP_PASS, 1 /*channel*/, 0 /*hidden*/, 4 /*max conn*/);
+  Serial.printf("AP start: %s | AP-IP: %s\n", apOK ? "OK" : "FAIL", WiFi.softAPIP().toString().c_str());
+
+  // STA optional verbinden, falls Credentials vorhanden
+  if (strlen(STA_SSID) > 0 && strlen(STA_PASS) > 0) {
+    WiFi.begin(STA_SSID, STA_PASS);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+      delay(200);
+    }
+    Serial.printf("STA status: %d, IP: %s\n", WiFi.status(), WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("STA skipped (keine Credentials gesetzt).");
   }
-  Serial.print("IP: ");
-  Serial.println( (WiFi.getMode()==WIFI_AP)? WiFi.softAPIP() : WiFi.localIP() );
 }
 
 void setup() {
@@ -423,14 +436,13 @@ void setup() {
   SPIFFS.begin(true);
   SPIFFS.mkdir("/img");
 
-  // Framebuffer dynamisch anfordern (8-Bit fähiger Heap)
+  // Framebuffer dynamisch anfordern (8-Bit Heap)
   fbCurr = (uint16_t*) heap_caps_malloc(TFT_W * TFT_H * 2, MALLOC_CAP_8BIT);
   fbNext = (uint16_t*) heap_caps_malloc(TFT_W * TFT_H * 2, MALLOC_CAP_8BIT);
   if (!fbCurr || !fbNext) {
-    // Minimalfall: mit einer Pufferfläche weiter (kein Crossfade)
     if (!fbCurr) fbCurr = (uint16_t*) heap_caps_malloc(TFT_W * TFT_H * 2, MALLOC_CAP_8BIT);
     if (!fbCurr) { while (1) { Serial.println("RAM-Allocation failed"); delay(1000);} }
-    fbNext = fbCurr; // Crossfade später intern überspringen
+    fbNext = fbCurr; // Crossfade später überspringen, falls nur ein Buffer
   }
 
   // Decoder-Init
@@ -454,10 +466,7 @@ void loop() {
     renderDemoFrame(demoPhase);
     demoPhase += 0.08f;
 
-    // kurzer Übergang zwischen Demo-Frames (wenn 2 Puffer vorhanden)
     if (fbNext != fbCurr) {
-      // fbCurr = alt, fbNext = neu (already prepared)
-      // zeilenweiser Crossfade ~100ms
       unsigned long t0 = millis();
       while (millis() - t0 < 100) {
         uint8_t a = (uint8_t)(((millis() - t0) * 255) / 100);
@@ -467,7 +476,6 @@ void loop() {
       }
     }
     blitFull(fbNext);
-    // tausche Rolle (nur wenn 2 Puffer)
     if (fbNext != fbCurr) std::swap(fbCurr, fbNext);
     delay(60);
     return;
@@ -482,7 +490,6 @@ void loop() {
     bool ok = renderImageToNext(path);
     if (!ok) return;
 
-    // Crossfade (nur wenn 2 Puffer existieren)
     if (fbNext != fbCurr) {
       unsigned long t0 = millis();
       unsigned long dur = (unsigned long)std::max<long>(0, fadeMs);
@@ -499,7 +506,6 @@ void loop() {
       }
       std::swap(fbCurr, fbNext);
     } else {
-      // nur ein Puffer: direkt zeichnen
       blitFull(fbCurr);
     }
   }
