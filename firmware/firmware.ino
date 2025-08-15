@@ -1,485 +1,478 @@
-/***** ESP32/ESP32-S2 Slideshow mit PNG+JPG, Crossfade, OTA, AsyncWebServer *****
- * Display: ST7735 160x128 (Adafruit_ST7735)
- * Rotation: 1 (quer)
- * Web: Upload (JPG/PNG), Liste, Start/Stop, Intervall (ms), Crossfade (ms), Löschen, OTA
- * Speicher: SPIFFS  /images  (Dateinamen ohne Leerzeichen empfohlen)
- *******************************************************************************/
+/*
+  ESP32-S2 Bildrahmen / Slideshow (Projekt 8)
+  - Display: ST7735 160x128, Rotation = 1
+  - Deine Pins: CS=5, RST=6, DC=7, MOSI=11, SCLK=12, LED=13 (mit PWM-Dimmen)
+  - JPG + PNG aus SPIFFS (/img)
+  - Web-UI: Upload (jpg/png), Liste, Autoplay/Intervall/Fade, Helligkeit-Slider, OTA-Update
+  - Echtes Crossfade (RGB565 Blend, 2 Framebuffer)
+  - Demo-Animation, solange kein Intervall gesetzt ist
+  - Getestet gegen ESP32 Core 2.0.17 + Adafruit/Async/TJpg/PNGdec (siehe Workflow)
+*/
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <FS.h>
 #include <SPIFFS.h>
-
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7735.h>
-
-// ---- TFT Pins (wie bei dir) ----
-#define TFT_CS   5
-#define TFT_RST  6
-#define TFT_DC   7
-#define TFT_MOSI 11
-#define TFT_SCLK 12
-#define TFT_LED  13
-
-Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
-
-// -------------- WiFi / Web ----------------
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <Update.h>
 
-const char* WIFI_SSID = "Peng";            // STA-Zugang – anpassen
-const char* WIFI_PASS = "DEIN_PASSWORT";   // "" => AP-Fallback
-AsyncWebServer server(80);
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
 
-// -------------- Bild Decoder --------------
-#include <TJpg_Decoder.h>   // JPG
-#include <PNGdec.h>         // PNG
-PNG png;
+#include <TJpg_Decoder.h>
+#include <PNGdec.h>
+#include <algorithm>
 
-// -------------- Anzeigeparameter ----------
+// -------------------- TFT-Pins (dein Setup) --------------------
+#define TFT_CS    5
+#define TFT_RST   6
+#define TFT_DC    7
+#define TFT_MOSI 11
+#define TFT_SCLK 12
+#define TFT_LED  13   // Backlight (PWM über LEDC)
+
 static const int TFT_W = 160;
 static const int TFT_H = 128;
-static const uint16_t COL_BG   = ST77XX_BLACK;
-static const uint16_t COL_TEXT = ST77XX_WHITE;
 
-// Frame-Puffer für echtes Crossfade (RGB565)
-static uint16_t* framePrev = nullptr;  // TFT_W * TFT_H * 2 Bytes
-static uint16_t* frameNext = nullptr;
+// Software-SPI Konstruktor (nutzt deine MOSI/SCLK Pins sicher)
+Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
-// Player-Status
-bool autoplay = false;
-uint32_t intervalMs = 3000;   // Default Intervall
-uint32_t fadeMs     = 600;    // Crossfade-Dauer
-uint32_t lastSwitch = 0;
-int currentIndex    = -1;     // Index in images[]
+// -------------------- Backlight / LEDC -------------------------
+static void setBacklight(uint8_t level) {
+  static bool init = false;
+  if (!init) {
+    ledcSetup(0 /*channel*/, 5000 /*Hz*/, 8 /*bits*/);
+    ledcAttachPin(TFT_LED, 0);
+    init = true;
+  }
+  ledcWrite(0, level); // 0..255
+}
 
-#define MAX_IMAGES 256
-String images[MAX_IMAGES];
+// -------------------- Netzwerk -------------------------------
+const char* STA_SSID = "Peng";
+const char* STA_PASS = "";           // leer => AP-Fallback
+const char* AP_SSID  = "ESP-Frame";
+const char* AP_PASS  = "12345678";
+
+AsyncWebServer server(80);
+
+// -------------------- Slideshow/Buffer ------------------------
+static uint16_t fbA[TFT_W * TFT_H];
+static uint16_t fbB[TFT_W * TFT_H];
+static uint16_t* fbCurr = fbA;
+static uint16_t* fbNext = fbB;
+
+bool autoplay = false;       // wird true, wenn intervalMs > 0 gesetzt wird
+long intervalMs = 0;         // 0 = Demo-Mode
+long fadeMs     = 600;       // Crossfade-Dauer in ms
+unsigned long lastSwitch = 0;
+int currentIndex = -1;
+
+String images[128];
 int imageCount = 0;
 
-// Hilfsfunktionen --------------------------------------------------------------
+uint8_t brightness = 255;    // 0..255
 
-static inline uint16_t rgb888_to_565(uint8_t r, uint8_t g, uint8_t b) {
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | ((b) >> 3);
+// -------------------- Decoder-Instanzen -----------------------
+PNG png;
+
+// Ziel-Kontext für JPG-Callback
+struct BlitCtx {
+  uint16_t* dst;
+  int dstW, dstH;
+  int ox, oy;
+} jpgCtx;
+
+// -------------------- Helfer -------------------------------
+static void blitFull(const uint16_t* buf) {
+  tft.drawRGBBitmap(0, 0, buf, TFT_W, TFT_H);
 }
 
-void fillScreenFromBuffer(const uint16_t* src) {
-  // Komplettbild aus Puffer auf TFT schieben (schnell)
-  tft.startWrite();
-  tft.setAddrWindow(0, 0, TFT_W, TFT_H);
-  // Adafruit_ST7735 erwartet 16-Bit RGB565 als HighByte/LowByte
-  for (int i = 0; i < TFT_W * TFT_H; i++) {
-    uint16_t c = src[i];
-    tft.writePixel(c);
+static void clearFB(uint16_t* fb, uint16_t color = 0x0000) {
+  for (int i = 0; i < TFT_W * TFT_H; ++i) fb[i] = color;
+}
+
+static void crossfade(uint8_t alpha /*0..255*/) {
+  for (int i = 0; i < TFT_W * TFT_H; ++i) {
+    uint16_t c0 = fbCurr[i];
+    uint16_t c1 = fbNext[i];
+
+    uint16_t r0 = (c0 >> 11) & 0x1F;
+    uint16_t g0 = (c0 >> 5)  & 0x3F;
+    uint16_t b0 =  c0        & 0x1F;
+
+    uint16_t r1 = (c1 >> 11) & 0x1F;
+    uint16_t g1 = (c1 >> 5)  & 0x3F;
+    uint16_t b1 =  c1        & 0x1F;
+
+    uint16_t r = ( ((r0 * (255 - alpha)) + (r1 * alpha)) >> 8 );
+    uint16_t g = ( ((g0 * (255 - alpha)) + (g1 * alpha)) >> 8 );
+    uint16_t b = ( ((b0 * (255 - alpha)) + (b1 * alpha)) >> 8 );
+
+    fbA[i] = (r << 11) | (g << 5) | b;   // mix in fbA als Ausgabepuffer
   }
-  tft.endWrite();
+  blitFull(fbA);
 }
 
-void crossfadeToNext() {
-  if (!framePrev || !frameNext) return;
-  if (fadeMs == 0) { fillScreenFromBuffer(frameNext); memcpy(framePrev, frameNext, TFT_W*TFT_H*2); return; }
+// ================= JPG (TJpg_Decoder) =========================
+static bool jpgToBuffer(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t* bmp) {
+  int dstW = jpgCtx.dstW, dstH = jpgCtx.dstH;
+  int ox = jpgCtx.ox, oy = jpgCtx.oy;
 
-  uint32_t steps = constrain(fadeMs / 16, 1u, 60u);  // ~60..1 Schritte
-  static uint16_t* mix = nullptr;
-  if (!mix) mix = (uint16_t*)heap_caps_malloc(TFT_W * TFT_H * 2, MALLOC_CAP_8BIT);
+  for (int row = 0; row < h; ++row) {
+    int dy = y + oy + row;
+    if (dy < 0 || dy >= dstH) continue;
+    uint16_t* dline = jpgCtx.dst + dy * dstW;
 
-  for (uint32_t s = 1; s <= steps; s++) {
-    float a = (float)s / (float)steps;  // 0..1
-    // Mischen (565 -> 888 -> LERP -> 565)
-    for (int i = 0; i < TFT_W * TFT_H; i++) {
-      uint16_t p = framePrev[i], n = frameNext[i];
-      // aus 565 extrahieren
-      uint8_t pr = (p >> 8) & 0xF8, pg = (p >> 3) & 0xFC, pb = (p << 3) & 0xF8;
-      uint8_t nr = (n >> 8) & 0xF8, ng = (n >> 3) & 0xFC, nb = (n << 3) & 0xF8;
-      uint8_t r = pr + (nr - pr) * a;
-      uint8_t g = pg + (ng - pg) * a;
-      uint8_t b = pb + (nb - pb) * a;
-      mix[i] = rgb888_to_565(r, g, b);
+    int sx = 0, dx = x + ox;
+    if (dx < 0) { sx = -dx; dx = 0; }
+    int copy = std::min(w - sx, dstW - dx);
+    if (copy > 0) {
+      memcpy(dline + dx, bmp + row * w + sx, copy * sizeof(uint16_t));
     }
-    fillScreenFromBuffer(mix);
-    delay(16);
-  }
-  // Übernahme als neues „prev“
-  memcpy(framePrev, frameNext, TFT_W * TFT_H * 2);
-}
-
-// --------- Bild in frameNext decodieren (Fit + Zentrieren) ----------
-// Ziel: gesamte Fläche füllen (letterbox/pillarbox mit schwarz)
-
-void clearBuffer(uint16_t* dst, uint16_t color) {
-  for (int i = 0; i < TFT_W * TFT_H; i++) dst[i] = color;
-}
-
-// ---- JPG Callback: schreibt Kachel in frameNext an offset+scale
-struct JPGContext {
-  uint16_t* buf;
-  int x0, y0; // Offset
-};
-bool jpgDrawToBuffer(JPEGDRAW *pDraw) {
-  JPGContext* ctx = (JPGContext*)TJpgDec.getUserPointer();
-  int x = ctx->x0 + pDraw->x;
-  int y = ctx->y0 + pDraw->y;
-  if (x >= TFT_W || y >= TFT_H) return true;
-
-  // begrenzen
-  int w = pDraw->iWidth;
-  int h = pDraw->iHeight;
-  if (x + w > TFT_W) w = TFT_W - x;
-  if (y + h > TFT_H) h = TFT_H - y;
-
-  // pDraw->pPixels ist RGB565 (Little Endian)
-  // in frameNext kopieren, Zeile für Zeile
-  uint16_t* src = (uint16_t*)pDraw->pPixels;
-  for (int row = 0; row < h; row++) {
-    memcpy(&ctx->buf[(y + row) * TFT_W + x], &src[row * pDraw->iWidth], w * 2);
   }
   return true;
 }
 
-// ---- PNG Callback: je Zeile RGBA8888 in frameNext malen
-struct PNGContext {
-  uint16_t* buf;
-  int x0, y0, outW;
-};
+static bool renderJPGtoNext(const String& path) {
+  if (!SPIFFS.exists(path)) return false;
+  clearFB(fbNext, 0);
 
-void pngDraw(PNGDRAW *pDraw) {
-  PNGContext* ctx = (PNGContext*)pDraw->pUser;
-  uint8_t *line = png.getLineAsRGBA8(pDraw, 0);  // RGBA8888
-  int y = ctx->y0 + pDraw->y;
-  if (y < 0 || y >= TFT_H) return;
+  jpgCtx = { fbNext, TFT_W, TFT_H, 0, 0 };
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(true);
+  TJpgDec.setCallback(jpgToBuffer);
 
-  int maxW = min(pDraw->iWidth, ctx->outW);
-  for (int x = 0; x < maxW; x++) {
-    int xx = ctx->x0 + x;
-    if (xx < 0 || xx >= TFT_W) continue;
-    uint8_t r = line[x * 4 + 0];
-    uint8_t g = line[x * 4 + 1];
-    uint8_t b = line[x * 4 + 2];
-    uint8_t a = line[x * 4 + 3]; // (optional für Alpha)
-    if (a < 8) {
-      // transparente Pixel -> Hintergrund
-      continue;
-    }
-    ctx->buf[y * TFT_W + xx] = rgb888_to_565(r, g, b);
-  }
+  JRESULT rc = TJpgDec.drawFsJpg(0, 0, path);
+  return (rc == JDR_OK);
 }
 
-// ---- Helfer: Bilddatei (JPG/PNG) in frameNext decodieren ----
-bool renderImageToNext(const String& path) {
-  File f = SPIFFS.open(path, "r");
-  if (!f) return false;
+// ================= PNG (PNGdec) ===============================
+typedef struct { File f; } PNGFILEX;
 
-  clearBuffer(frameNext, COL_BG);
+static void* pngOpen(const char* fname, int32_t* size) {
+  PNGFILEX* p = (PNGFILEX*)malloc(sizeof(PNGFILEX));
+  if (!p) return nullptr;
+  p->f = SPIFFS.open(fname, "r");
+  if (!p->f) { free(p); return nullptr; }
+  *size = p->f.size();
+  return p;
+}
+static void pngClose(void* handle) {
+  PNGFILEX* p = (PNGFILEX*)handle;
+  if (p) { if (p->f) p->f.close(); free(p); }
+}
+static int32_t pngRead(PNGFILE* file, uint8_t* buf, int32_t len) {
+  PNGFILEX* p = (PNGFILEX*)file->fHandle;
+  return p->f.read(buf, len);
+}
+static int32_t pngSeek(PNGFILE* file, int32_t pos) {
+  PNGFILEX* p = (PNGFILEX*)file->fHandle;
+  p->f.seek(pos);
+  return pos;
+}
+static int pngDraw(PNGDRAW* pDraw) {
+  uint16_t* line = (uint16_t*)png.getLineAsRGB565(pDraw, 0);
+  int y = pDraw->y;
+  if (y < 0 || y >= TFT_H) return 1;
 
-  // Größe (ohne vollständiges Dekodieren) ermitteln
-  bool isPNG = path.endsWith(".png") || path.endsWith(".PNG");
-  bool isJPG = path.endsWith(".jpg") || path.endsWith(".jpeg") || path.endsWith(".JPG") || path.endsWith(".JPEG");
-
-  int srcW = 0, srcH = 0;
-  if (isJPG) {
-    TJpgDec.getJpgSize(&srcW, &srcH, f);
-  } else if (isPNG) {
-    int16_t rc = png.open(path.c_str(), SPIFFS);
-    if (rc == PNG_SUCCESS) {
-      srcW = png.getWidth();
-      srcH = png.getHeight();
-      png.close();
-    }
+  if (pDraw->x >= 0 && pDraw->x + pDraw->iWidth <= TFT_W) {
+    memcpy(&fbNext[y * TFT_W + pDraw->x], line, pDraw->iWidth * 2);
   } else {
-    f.close();
-    return false;
+    int sx = 0, dx = pDraw->x;
+    if (dx < 0) { sx = -dx; dx = 0; }
+    int copy = std::min(pDraw->iWidth - sx, TFT_W - dx);
+    if (copy > 0) memcpy(&fbNext[y * TFT_W + dx], line + sx, copy * 2);
   }
-
-  if (srcW <= 0 || srcH <= 0) { f.close(); return false; }
-
-  // Fit berechnen (Aspect-Fit)
-  float scale = min((float)TFT_W / srcW, (float)TFT_H / srcH);
-  int outW = max(1, (int)(srcW * scale));
-  int outH = max(1, (int)(srcH * scale));
-  int x0 = (TFT_W - outW) / 2;
-  int y0 = (TFT_H - outH) / 2;
-
-  bool ok = false;
-
-  if (isJPG) {
-    // JPG: Decoder unterstützt nur 1/1,1/2,1/4,1/8 – wir dekodieren nativ und lassen TJpg die Kacheln liefern
-    f.close(); // TJpg arbeitet selbst über FS
-    JPGContext ctx{ frameNext, x0, y0 };
-    TJpgDec.setUserPointer(&ctx);
-    TJpgDec.setJpgScale(1);     // beste Qualität, wir zentrieren
-    TJpgDec.setCallback(jpgDrawToBuffer);
-    ok = (TJpgDec.drawFsJpg(0, 0, path) == 1);
-  } else {
-    // PNG: PNGdec kann frei skalieren? – wir lesen 1:1 und lassen bei Bedarf clippen (Fit kleiner als TFT)
-    int16_t rc = png.open(path.c_str(), SPIFFS);
-    if (rc == PNG_SUCCESS) {
-      PNGContext ctx{ frameNext, x0, y0, outW };
-      png.setUserPointer(&ctx);
-      // PNGdec kann leider nicht „on-the-fly“ skalieren – wir clippen falls größer
-      ok = (png.decode(NULL, 0) == PNG_SUCCESS); // ruft pngDraw für jede Zeile
-      png.close();
-    } else ok = false;
-    f.close();
-  }
-
-  return ok;
+  return 1;
 }
 
-// ----------- Dateiverwaltung -------------
-void refreshList() {
+static bool renderPNGtoNext(const String& path) {
+  if (!SPIFFS.exists(path)) return false;
+  clearFB(fbNext, 0);
+
+  int rc = png.open(path.c_str(), pngOpen, pngClose, pngRead, pngSeek, pngDraw);
+  if (rc != PNG_SUCCESS) return false;
+  rc = png.decode(NULL, 0);
+  png.close();
+  return (rc == PNG_SUCCESS);
+}
+
+// ================= High-Level Loader ==========================
+static bool renderImageToNext(const String& path) {
+  String p = path; p.toLowerCase();
+  if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return renderJPGtoNext(path);
+  if (p.endsWith(".png"))                       return renderPNGtoNext(path);
+  return false;
+}
+
+// ================= Datei-Liste / SPIFFS =======================
+static void refreshList() {
   imageCount = 0;
-  File dir = SPIFFS.open("/images");
+  File dir = SPIFFS.open("/img");
   if (!dir || !dir.isDirectory()) return;
-  File f;
-  while ((f = dir.openNextFile())) {
-    String n = String(f.name());
-    f.close();
-    n.toLowerCase();
-    if (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png")) {
-      if (imageCount < MAX_IMAGES) images[imageCount++] = String(f.name());
+  File f = dir.openNextFile();
+  while (f && imageCount < (int)(sizeof(images)/sizeof(images[0]))) {
+    String name = String("/img/") + String(f.name()).substring(5);
+    String low = name; low.toLowerCase();
+    if (low.endsWith(".jpg") || low.endsWith(".jpeg") || low.endsWith(".png")) {
+      images[imageCount++] = name;
     }
+    f = dir.openNextFile();
   }
-  // sortieren (einfach)
-  for (int i=0;i<imageCount-1;i++) {
-    for (int j=i+1;j<imageCount;j++) {
-      if (images[j] < images[i]) { String t=images[i]; images[i]=images[j]; images[j]=t; }
-    }
+}
+
+static String listJSON() {
+  String out = F("[");
+  for (int i = 0; i < imageCount; ++i) {
+    if (i) out += ',';
+    out += '\"'; out += images[i]; out += '\"';
   }
-  if (currentIndex >= imageCount) currentIndex = imageCount - 1;
+  out += ']';
+  return out;
 }
 
-// ----------- Steuerung --------------------
-bool showByIndex(int idx, bool fade=true) {
-  if (idx < 0 || idx >= imageCount) return false;
-  String path = images[idx];
-  if (!renderImageToNext(path)) return false;
-
-  if (fade && framePrev) crossfadeToNext();
-  else { fillScreenFromBuffer(frameNext); memcpy(framePrev, frameNext, TFT_W*TFT_H*2); }
-
-  currentIndex = idx;
-  lastSwitch = millis();
-  return true;
+// ================= Demo-Animation =============================
+static void renderDemoFrame(float phase) {
+  clearFB(fbNext, 0x0000);
+  for (int x = 0; x < TFT_W; ++x) {
+    float t = (x / 20.0f) + phase;
+    int y = (int)((sinf(t) * 0.4f + 0.5f) * (TFT_H - 1));
+    if (y < 0) y = 0; if (y >= TFT_H) y = TFT_H - 1;
+    fbNext[y * TFT_W + x] = 0xFFE0; // Gelb
+  }
 }
 
-bool showNext(bool fade=true) {
-  if (imageCount == 0) return false;
-  int n = (currentIndex + 1) % imageCount;
-  return showByIndex(n, fade);
-}
-bool showPrev(bool fade=true) {
-  if (imageCount == 0) return false;
-  int p = (currentIndex - 1 + imageCount) % imageCount;
-  return showByIndex(p, fade);
-}
-
-// ---------------- Web UI -----------------
-const char* PAGE_INDEX = R"HTML(
-<!doctype html><html><head>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>ESP Slideshow</title>
-<style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:14px;background:#111;color:#eee}
-h1{font-size:18px;margin:8px 0}
-.card{background:#1b1b1b;border-radius:12px;padding:12px;margin:10px 0;border:1px solid #333}
-label{display:block;margin:6px 0 2px}
-input[type=number]{width:120px}
-.btn{display:inline-block;padding:8px 12px;margin:4px;border-radius:8px;border:1px solid #444;background:#222;color:#eee;cursor:pointer}
-.btn:hover{background:#2a2a2a}
-ul{padding-left:18px}
-li{margin:4px 0}
-small{color:#bbb}
-</style></head><body>
-<h1>ESP Slideshow</h1>
-
-<div class=card>
-  <form id="up" method="POST" action="/upload" enctype="multipart/form-data">
-    <label>Datei hochladen (JPG/PNG)</label>
-    <input type="file" name="file">
-    <button class=btn>Upload</button>
-  </form>
-  <form id="ota" method="POST" action="/update" enctype="multipart/form-data" style="margin-top:10px">
-    <label>OTA Firmware (.bin)</label>
-    <input type="file" name="firmware">
-    <button class=btn>Flash</button>
-  </form>
+// ================= Web-UI (inkl. OTA + Brightness) ============
+static const char* INDEX_HTML = R"HTML(
+<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>ESP Frame</title>
+<style>body{font-family:system-ui;margin:16px}label{display:block;margin:.5em 0}input,button{font-size:1rem} .row{display:flex;gap:12px;align-items:center}</style>
+<h1>ESP32-S2 Bildrahmen</h1>
+<section>
+<h2>Upload (JPG/PNG)</h2>
+<form id="up" method="POST" action="/upload" enctype="multipart/form-data">
+<input type="file" name="file" accept=".jpg,.jpeg,.png" required>
+<button>Hochladen</button>
+</form>
+</section>
+<section>
+<h2>Steuerung</h2>
+<label>Intervall (ms): <input id="ival" type="number" min="0" step="100" value="0"></label>
+<label>Fade (ms): <input id="fade" type="number" min="0" step="50" value="600"></label>
+<label class="row"><input id="auto" type="checkbox"> <span>Autoplay</span></label>
+<div class="row">
+  <label for="br">Helligkeit:</label>
+  <input id="br" type="range" min="0" max="255" value="255" oninput="brv.value=this.value" onchange="setBright(this.value)">
+  <output id="brv">255</output>
 </div>
-
-<div class=card>
-  <div>
-    <button class=btn onclick="fetch('/prev')">◀️ Zurück</button>
-    <button class=btn onclick="fetch('/next')">▶️ Weiter</button>
-    <button class=btn onclick="fetch('/play?on=1')">▶️ Auto</button>
-    <button class=btn onclick="fetch('/play?on=0')">⏸️ Stop</button>
-  </div>
-  <div style="margin-top:8px">
-    <label>Intervall (ms)</label>
-    <input id=i type=number min=500 step=100>
-    <button class=btn onclick="setInt()">Speichern</button>
-  </div>
-  <div style="margin-top:8px">
-    <label>Crossfade (ms)</label>
-    <input id=f type=number min=0 step=50>
-    <button class=btn onclick="setFade()">Speichern</button>
-  </div>
-  <small id=st></small>
-</div>
-
-<div class=card>
-  <b>Bilder</b>
-  <ul id="list"></ul>
-</div>
-
+<button onclick="apply()">Übernehmen</button>
+</section>
+<section>
+<h2>Dateien</h2>
+<pre id="list">(laden…)</pre>
+</section>
+<hr>
+<section>
+<h2>OTA Update</h2>
+<form method="POST" action="/update" enctype="multipart/form-data">
+<input type="file" name="firmware" accept=".bin" required>
+<button>Firmware flashen</button>
+</form>
+</section>
 <script>
-async function refresh(){
-  let r = await fetch('/status'); let s = await r.json();
-  document.getElementById('i').value = s.interval;
-  document.getElementById('f').value = s.fade;
-  document.getElementById('st').innerText = `Autoplay: ${s.autoplay?'AN':'AUS'} | Bilder: ${s.count} | Aktuell: ${s.current}`;
-  let ul = document.getElementById('list');
-  ul.innerHTML = '';
-  s.files.forEach((name,idx)=>{
-    let li = document.createElement('li');
-    li.innerHTML = `${idx==s.current?'👉 ':''}${name} 
-      <button class=btn onclick="fetch('/show?i=${idx}')">Anzeigen</button>
-      <button class=btn onclick="fetch('/delete?i=${idx}').then(()=>refresh())">Löschen</button>`;
-    ul.appendChild(li);
-  });
+async function loadList(){
+  let r = await fetch('/api/list'); let j = await r.json();
+  list.textContent = j.join('\\n');
+  // aktuelle Helligkeit laden
+  try {
+    let s = await fetch('/api/status'); let js = await s.json();
+    if (js && typeof js.brightness === 'number') {
+      br.value = js.brightness; brv.value = js.brightness;
+      ival.value = js.interval; fade.value = js.fade; auto.checked = !!js.autoplay;
+    }
+  } catch(e){}
 }
-function setInt(){ fetch('/interval?ms='+document.getElementById('i').value).then(refresh); }
-function setFade(){ fetch('/fade?ms='+document.getElementById('f').value).then(refresh); }
-refresh(); setInterval(refresh, 3000);
+async function apply(){
+  let ms=+ival.value||0, fd=+fade.value||0, au=auto.checked?1:0;
+  await fetch(`/api/set?interval=${ms}&fade=${fd}&auto=${au}`);
+  alert('OK');
+}
+async function setBright(v){
+  await fetch(`/api/bright?lvl=${v}`);
+}
+loadList();
 </script>
-</body></html>
 )HTML";
 
-void setupWeb() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){ r->send(200, "text/html", PAGE_INDEX); });
+static void setupWeb() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){ r->send(200, "text/html", INDEX_HTML); });
 
-  // Upload Bild
-  server.on("/upload", HTTP_POST,
-    [](AsyncWebServerRequest* r){ r->send(200,"text/plain","OK"); refreshList(); },
-    [](AsyncWebServerRequest* r, String fn, size_t index, uint8_t *data, size_t len, bool final){
-      if (index==0) {
-        if (!SPIFFS.exists("/images")) SPIFFS.mkdir("/images");
-        // Normalisiere Endung
-        fn.toLowerCase();
-        if (!fn.endsWith(".jpg") && !fn.endsWith(".jpeg") && !fn.endsWith(".png")) fn += ".jpg";
-        r->_tempFile = SPIFFS.open("/images/"+fn, "w");
+  server.on("/api/list", HTTP_GET, [](AsyncWebServerRequest* r){
+    refreshList();
+    r->send(200, "application/json", listJSON());
+  });
+
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* r){
+    String j = "{\"interval\":" + String(intervalMs)
+             + ",\"fade\":" + String(fadeMs)
+             + ",\"autoplay\":" + String(autoplay ? 1 : 0)
+             + ",\"brightness\":" + String(brightness) + "}";
+    r->send(200, "application/json", j);
+  });
+
+  server.on("/api/set", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (r->hasParam("interval")) {
+      long v = r->getParam("interval")->value().toInt();
+      intervalMs = std::max<long>(0, (long)v);
+      autoplay = intervalMs > 0;
+    }
+    if (r->hasParam("fade")) {
+      long v = r->getParam("fade")->value().toInt();
+      fadeMs = std::max<long>(0, (long)v);
+    }
+    if (r->hasParam("auto")) {
+      autoplay = r->getParam("auto")->value() == "1";
+    }
+    r->send(200, "text/plain", "OK");
+  });
+
+  server.on("/api/bright", HTTP_GET, [](AsyncWebServerRequest* r){
+    if (r->hasParam("lvl")) {
+      int v = r->getParam("lvl")->value().toInt();
+      if (v < 0) v = 0; if (v > 255) v = 255;
+      brightness = (uint8_t)v;
+      setBacklight(brightness);
+    }
+    r->send(200, "text/plain", "OK");
+  });
+
+  // Upload -> /img/
+  server.on(
+    "/upload", HTTP_POST,
+    [](AsyncWebServerRequest* r){ r->send(200, "text/plain", "OK"); },
+    [](AsyncWebServerRequest* r, String fn, size_t idx, uint8_t* data, size_t len, bool fin){
+      static File up;
+      if (idx == 0) {
+        SPIFFS.mkdir("/img");
+        String path = "/img/" + fn;
+        up = SPIFFS.open(path, "w");
       }
-      if (r->_tempFile) r->_tempFile.write(data, len);
-      if (final && r->_tempFile) r->_tempFile.close();
-    });
-
-  // OTA (klassisch, wie bei OTA-only)
-  server.on("/update", HTTP_POST,
-    [](AsyncWebServerRequest *request){
-      bool ok = !Update.hasError();
-      request->send(200, "text/plain", ok ? "Update OK, rebooting..." : "Update FAILED");
-      if (ok) { delay(300); ESP.restart(); }
-    },
-    [](AsyncWebServerRequest *request, String fn, size_t index, uint8_t *data, size_t len, bool final){
-      if (!index) { Update.begin(UPDATE_SIZE_UNKNOWN); }
-      if (Update.write(data, len) != len) { Update.printError(Serial); }
-      if (final) { if (!Update.end(true)) Update.printError(Serial); }
+      if (up) up.write(data, len);
+      if (fin && up) { up.close(); }
     }
   );
 
-  // Steuerung / Status
-  server.on("/status", HTTP_GET, [](AsyncWebServerRequest* r){
-    String json = "{";
-    json += "\"autoplay\":"; json += autoplay?"true":"false"; json += ",";
-    json += "\"interval\":" + String(intervalMs) + ",";
-    json += "\"fade\":" + String(fadeMs) + ",";
-    json += "\"count\":" + String(imageCount) + ",";
-    json += "\"current\":" + String(currentIndex<0?0:currentIndex) + ",";
-    json += "\"files\":[";
-    for (int i=0;i<imageCount;i++){ if (i) json+=','; json += "\""+images[i]+"\""; }
-    json += "]}";
-    r->send(200,"application/json",json);
-  });
-
-  server.on("/play", HTTP_GET, [](AsyncWebServerRequest* r){
-    bool on = r->hasParam("on") ? (r->getParam("on")->value().toInt()!=0) : true;
-    autoplay = on; r->send(200,"text/plain","OK");
-  });
-  server.on("/interval", HTTP_GET, [](AsyncWebServerRequest* r){
-    if (r->hasParam("ms")) intervalMs = max(500, r->getParam("ms")->value().toInt());
-    r->send(200,"text/plain","OK");
-  });
-  server.on("/fade", HTTP_GET, [](AsyncWebServerRequest* r){
-    if (r->hasParam("ms")) fadeMs = max(0, r->getParam("ms")->value().toInt());
-    r->send(200,"text/plain","OK");
-  });
-  server.on("/next", HTTP_GET, [](AsyncWebServerRequest* r){ showNext(); r->send(200,"text/plain","OK"); });
-  server.on("/prev", HTTP_GET, [](AsyncWebServerRequest* r){ showPrev(); r->send(200,"text/plain","OK"); });
-  server.on("/show", HTTP_GET, [](AsyncWebServerRequest* r){
-    int i = r->hasParam("i") ? r->getParam("i")->value().toInt() : 0;
-    showByIndex(constrain(i,0,max(0,imageCount-1))); r->send(200,"text/plain","OK");
-  });
-  server.on("/delete", HTTP_GET, [](AsyncWebServerRequest* r){
-    if (r->hasParam("i")) {
-      int i = r->getParam("i")->value().toInt();
-      if (i>=0 && i<imageCount) SPIFFS.remove(images[i]);
-      refreshList();
+  // OTA Update
+  server.on("/update", HTTP_POST,
+    [](AsyncWebServerRequest* r){
+      bool ok = !Update.hasError();
+      r->send(200, "text/plain", ok ? "Update OK. Rebooting…" : "Update FAILED!");
+      delay(500);
+      if (ok) ESP.restart();
+    },
+    [](AsyncWebServerRequest* r, String fn, size_t idx, uint8_t* data, size_t len, bool fin){
+      if (idx == 0) {
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); }
+      }
+      if (len) {
+        if (Update.write(data, len) != len) { Update.printError(Serial); }
+      }
+      if (fin) { if (!Update.end(true)) Update.printError(Serial); }
     }
-    r->send(200,"text/plain","OK");
-  });
+  );
 
   server.begin();
 }
 
-// ---------------- Setup / Loop ----------------
-void setBacklight(uint8_t duty /*0..255*/) {
-  static bool init=false;
-  if (!init) { ledcSetup(0, 5000, 8); ledcAttachPin(TFT_LED, 0); init=true; }
-  ledcWrite(0, duty);
+// -------------------- Setup / Loop ---------------------------
+static void wifiStart() {
+  WiFi.mode(WIFI_STA);
+  if (strlen(STA_PASS)) WiFi.begin(STA_SSID, STA_PASS);
+  unsigned long t0 = millis();
+  while (strlen(STA_PASS) && WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(200);
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+  }
+  Serial.print("IP: "); Serial.println( (WiFi.getMode()==WIFI_AP)? WiFi.softAPIP() : WiFi.localIP() );
 }
 
 void setup() {
   Serial.begin(115200);
+
   // Display
   tft.initR(INITR_BLACKTAB);
-  tft.setRotation(1); // gewünscht
-  tft.fillScreen(COL_BG);
-  setBacklight(255);
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_BLACK);
+  setBacklight(brightness);   // Backlight an
 
-  // Speicher
+  // FS
   SPIFFS.begin(true);
-  if (!SPIFFS.exists("/images")) SPIFFS.mkdir("/images");
+  SPIFFS.mkdir("/img");
 
-  // Framebuffer
-  framePrev = (uint16_t*)heap_caps_malloc(TFT_W*TFT_H*2, MALLOC_CAP_8BIT);
-  frameNext = (uint16_t*)heap_caps_malloc(TFT_W*TFT_H*2, MALLOC_CAP_8BIT);
-  clearBuffer(framePrev, COL_BG);
-  clearBuffer(frameNext, COL_BG);
-  fillScreenFromBuffer(framePrev);
+  // Decoder-Init
+  TJpgDec.setSwapBytes(true); // wichtig auf ESP32
 
-  // JPG-Decoder Basis
-  TJpgDec.setSwapBytes(true); // RGB565 Endian richtig
-  // (Callback setzen wir dynamisch in renderImageToNext)
-
-  // WiFi
-  WiFi.mode(WIFI_STA);
-  if (strlen(WIFI_PASS)) WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t0 = millis();
-  while (strlen(WIFI_PASS) && WiFi.status()!=WL_CONNECTED && millis()-t0<8000) delay(200);
-  if (WiFi.status()!=WL_CONNECTED) {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("Slideshow_ESP","12345678");
-  }
-
-  refreshList();
+  // Netzwerk + Web
+  wifiStart();
   setupWeb();
+  refreshList();
 
-  // Start: erstes Bild (falls vorhanden)
-  if (imageCount>0) showByIndex(0, false);
+  clearFB(fbCurr, 0);
+  clearFB(fbNext, 0);
+  blitFull(fbCurr);
 }
 
 void loop() {
-  if (autoplay && imageCount>0 && millis()-lastSwitch >= intervalMs) {
-    showNext(true);
+  static float demoPhase = 0.0f;
+
+  // Demo-Mode, solange kein Intervall/kein Bild
+  if (!autoplay || intervalMs <= 0 || imageCount == 0) {
+    renderDemoFrame(demoPhase);
+    demoPhase += 0.08f;
+
+    // kurzer Übergang zwischen Demo-Frames
+    std::swap(fbCurr, fbNext);
+    unsigned long t0 = millis();
+    while (millis() - t0 < 100) {
+      uint8_t a = (uint8_t)(((millis() - t0) * 255) / 100);
+      if (a > 255) a = 255;
+      crossfade(a);
+      delay(10);
+    }
+    blitFull(fbNext);
+    delay(60);
+    return;
   }
+
+  // Autoplay
+  unsigned long now = millis();
+  if (lastSwitch == 0 || now - lastSwitch >= (unsigned long)intervalMs) {
+    lastSwitch = now;
+    currentIndex = (currentIndex + 1) % imageCount;
+    String path = images[currentIndex];
+    bool ok = renderImageToNext(path);
+    if (!ok) return;
+
+    // Crossfade
+    std::swap(fbCurr, fbNext); // fbCurr = alt, fbNext = neu
+    unsigned long t0 = millis();
+    unsigned long dur = (unsigned long)std::max<long>(0, fadeMs);
+    if (dur == 0) {
+      blitFull(fbNext);
+    } else {
+      while (millis() - t0 < dur) {
+        uint8_t a = (uint8_t)(((millis() - t0) * 255) / dur);
+        if (a > 255) a = 255;
+        crossfade(a);
+        delay(10);
+      }
+      blitFull(fbNext);
+    }
+  }
+
+  delay(5);
 }
