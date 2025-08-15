@@ -2,9 +2,6 @@ name: build
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -12,102 +9,73 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Set up job
-        run: echo "Starting build…"
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---- Arduino CLI ohne Action-Wrapper (Fix für 'unable to get latest version') ----
-      - name: Install Arduino CLI (pinned)
-        shell: bash
+      # ---- Arduino CLI zuverlässig installieren (ohne setup-Action) ----
+      - name: Install Arduino CLI
         run: |
           set -e
-          VER=0.35.2
-          curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_${VER}_Linux_64bit.tar.gz" \
-            | tar -xz
-          sudo mv arduino-cli /usr/local/bin/arduino-cli
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz \
+            | tar xz -C "$HOME/.local/bin" --strip-components=1 arduino-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           arduino-cli version
 
-      # ---- Cache: Core & Libs ----
+      # ---- Cache für Core, Pakete & Bibliotheken ----
       - name: Cache Arduino core & packages
         uses: actions/cache@v4
         with:
           path: |
             ~/.arduino15
-            ~/Arduino/hardware
-          key: arduino-core-${{ runner.os }}-v2-${{ hashFiles('.github/workflows/build.yml') }}
-
-      - name: Cache Arduino libraries
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/Arduino/libraries
-          key: arduino-libs-${{ runner.os }}-v3-${{ hashFiles('firmware/**/*.ino') }}
+            ~/Arduino
+          key: ${{ runner.os }}-arduino-${{ hashFiles('.github/workflows/build.yml') }}
           restore-keys: |
-            arduino-libs-${{ runner.os }}-v3-
+            ${{ runner.os }}-arduino-
 
-      # ---- ESP32 Core installieren ----
-      - name: Add ESP32 package index & update
-        run: |
-          arduino-cli config init
-          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-          arduino-cli core update-index
-
-      - name: Install ESP32 core (2.0.17)
-        run: |
-          arduino-cli core install esp32:esp32@2.0.17
-          arduino-cli board listall | grep -i esp32 || true
-
-      # ---- Bibliotheken (inkl. TJpg_Decoder + PNGdec) ----
-      - name: Install libraries (fixed set)
+      # ---- ESP32 Core einbinden & installieren (2.0.17) ----
+      - name: Add ESP32 package index & core update
         run: |
           set -e
-          # Netzwerk/OTA
+          arduino-cli config init --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.17
+          arduino-cli core list
+
+      # ---- Bibliotheken installieren (externe) ----
+      # WICHTIG: 'Update' NICHT installieren – kommt aus dem ESP32-Core.
+      - name: Install libraries (fixed set incl. TJpg_Decoder + PNGdec)
+        run: |
+          set -e
           arduino-cli lib install "AsyncTCP@1.1.1"
           arduino-cli lib install "ESP Async WebServer@3.6.0"
-          arduino-cli lib install "Update"
-          arduino-cli lib install "WiFi"
-          arduino-cli lib install "FS"
-          arduino-cli lib install "SPIFFS"
-          # Display
           arduino-cli lib install "Adafruit GFX Library@1.12.1"
           arduino-cli lib install "Adafruit ST7735 and ST7789 Library@1.11.0"
-          arduino-cli lib install "Adafruit BusIO@1.17.2"
-          arduino-cli lib install "SPI"
-          arduino-cli lib install "Wire"
-          # Decoder
           arduino-cli lib install "TJpg_Decoder"
           arduino-cli lib install "PNGdec"
+          arduino-cli lib list
 
-      # ---- Kompilieren aller .ino in firmware/ ----
+      # ---- Kompilieren: alle .ino in firmware/ ----
       - name: Compile sketches in firmware/
-        shell: bash
         run: |
           set -e
           mkdir -p build
           shopt -s nullglob
           for ino in firmware/*.ino; do
-            name=$(basename "$ino" .ino)
-            out="build/${name}"
-            mkdir -p "$out"
+            bn=$(basename "$ino" .ino)
             echo "==> Compiling: $ino"
             arduino-cli compile \
               --fqbn esp32:esp32:esp32s2 \
-              --build-path "$out" \
-              --warnings default \
+              --warnings all \
+              --build-path "build/${bn}" \
               "$ino"
           done
 
-      # ---- Artefakte hochladen ----
+      # ---- Artefakte hochladen (.bin / .elf) ----
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
           name: firmware-binaries
           path: |
-            build/**/*.bin
-            build/**/*.elf
-          if-no-files-found: warn
-
-      - name: Complete job
-        run: echo "Done."
+            build/**/**/*.bin
+            build/**/**/*.elf
