@@ -1,12 +1,12 @@
 /*
   ESP32-S2 Bildrahmen / Slideshow (Projekt 8)
   - Display: ST7735 160x128, Rotation = 1
-  - Deine Pins: CS=5, RST=6, DC=7, MOSI=11, SCLK=12, LED=13 (mit PWM-Dimmen)
+  - Deine Pins: CS=5, RST=6, DC=7, MOSI=11, SCLK=12, LED=13 (PWM-Dimmen)
   - JPG + PNG aus SPIFFS (/img)
   - Web-UI: Upload (jpg/png), Liste, Autoplay/Intervall/Fade, Helligkeit-Slider, OTA-Update
   - Echtes Crossfade (RGB565 Blend, 2 Framebuffer)
-  - Demo-Animation, solange kein Intervall gesetzt ist
-  - Getestet gegen ESP32 Core 2.0.17 + Adafruit/Async/TJpg/PNGdec (siehe Workflow)
+  - Demo-Animation solange kein Intervall gesetzt ist
+  - Für ESP32 Core 2.0.17 + Adafruit/Async/TJpg/PNGdec (siehe Workflow)
 */
 
 #include <Arduino.h>
@@ -36,7 +36,7 @@
 static const int TFT_W = 160;
 static const int TFT_H = 128;
 
-// Software-SPI Konstruktor (nutzt deine MOSI/SCLK Pins sicher)
+// Software-SPI Konstruktor (nutzt explizit MOSI/SCLK Pins)
 Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
 // -------------------- Backlight / LEDC -------------------------
@@ -117,18 +117,19 @@ static void crossfade(uint8_t alpha /*0..255*/) {
 }
 
 // ================= JPG (TJpg_Decoder) =========================
-static bool jpgToBuffer(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t* bmp) {
+// Korrekte Signatur für v1.1.0 (w/h als uint16_t!)
+static bool jpgToBuffer(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
   int dstW = jpgCtx.dstW, dstH = jpgCtx.dstH;
   int ox = jpgCtx.ox, oy = jpgCtx.oy;
 
-  for (int row = 0; row < h; ++row) {
+  for (uint16_t row = 0; row < h; ++row) {
     int dy = y + oy + row;
     if (dy < 0 || dy >= dstH) continue;
     uint16_t* dline = jpgCtx.dst + dy * dstW;
 
     int sx = 0, dx = x + ox;
     if (dx < 0) { sx = -dx; dx = 0; }
-    int copy = std::min(w - sx, dstW - dx);
+    int copy = std::min<int>(w - sx, dstW - dx);
     if (copy > 0) {
       memcpy(dline + dx, bmp + row * w + sx, copy * sizeof(uint16_t));
     }
@@ -149,7 +150,8 @@ static bool renderJPGtoNext(const String& path) {
   return (rc == JDR_OK);
 }
 
-// ================= PNG (PNGdec) ===============================
+// ================= PNG (PNGdec 1.1.4) ========================
+// FS-Handle für PNGdec
 typedef struct { File f; } PNGFILEX;
 
 static void* pngOpen(const char* fname, int32_t* size) {
@@ -173,19 +175,22 @@ static int32_t pngSeek(PNGFILE* file, int32_t pos) {
   p->f.seek(pos);
   return pos;
 }
+
+// Draw-Callback: liefert eine Zeile als RGB565.
+// Achtung: PNGdec 1.1.4 hat kein pDraw->x; wir gehen von x=0 aus.
 static int pngDraw(PNGDRAW* pDraw) {
-  uint16_t* line = (uint16_t*)png.getLineAsRGB565(pDraw, 0);
+  static uint16_t line[TFT_W];
+  // BIG_ENDIAN passt zu Adafruit drawRGBBitmap
+  png.getLineAsRGB565(pDraw, line, PNG_RGB565_BIG_ENDIAN, 0xFFFF);
+
   int y = pDraw->y;
   if (y < 0 || y >= TFT_H) return 1;
 
-  if (pDraw->x >= 0 && pDraw->x + pDraw->iWidth <= TFT_W) {
-    memcpy(&fbNext[y * TFT_W + pDraw->x], line, pDraw->iWidth * 2);
-  } else {
-    int sx = 0, dx = pDraw->x;
-    if (dx < 0) { sx = -dx; dx = 0; }
-    int copy = std::min(pDraw->iWidth - sx, TFT_W - dx);
-    if (copy > 0) memcpy(&fbNext[y * TFT_W + dx], line + sx, copy * 2);
-  }
+  int w = pDraw->iWidth;
+  if (w > TFT_W) w = TFT_W;
+
+  // Wir beginnen links bei 0 (kein Offset-Feld vorhanden)
+  memcpy(&fbNext[y * TFT_W + 0], line, w * 2);
   return 1;
 }
 
@@ -286,7 +291,6 @@ static const char* INDEX_HTML = R"HTML(
 async function loadList(){
   let r = await fetch('/api/list'); let j = await r.json();
   list.textContent = j.join('\\n');
-  // aktuelle Helligkeit laden
   try {
     let s = await fetch('/api/status'); let js = await s.json();
     if (js && typeof js.brightness === 'number') {
@@ -397,7 +401,8 @@ static void wifiStart() {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
   }
-  Serial.print("IP: "); Serial.println( (WiFi.getMode()==WIFI_AP)? WiFi.softAPIP() : WiFi.localIP() );
+  Serial.print("IP: ");
+  Serial.println( (WiFi.getMode()==WIFI_AP)? WiFi.softAPIP() : WiFi.localIP() );
 }
 
 void setup() {
