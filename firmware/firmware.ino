@@ -1,19 +1,20 @@
 /*
-  ESP2 MASTER – Layout-Refresh (auf Basis 1.4.0)
-  FW: 1.4.1
+  ESP2 MASTER – Spotify Look (auf Basis 1.4.0)
+  FW: 1.4.2-M
 
-  Nur Optik geändert:
-   - Header: FW + MQTT-Status
-   - Mitte: großer Titel + kleiner Artist (aus "Artist - Title")
-   - Statusbereich: farbiger STATE + Prozent + Lautstärke-Balken (aus "STATE XX%")
-   - Footer: STA-IP + SoftAP-IP angezeigt
-   - Partielles Redraw (nur geänderte Bereiche)
+  Änderungen NUR Optik:
+   - Headerleiste mit kleinem Spotify-Icon + MQTT/FW
+   - Titel groß (Wrap), Artist klein
+   - State-Badge (PLAYING/PAUSED/STOPPED) in grün/gelb/rot
+   - Keine Prozent-/Lautstärkeanzeige mehr
+   - Partielle Redraws (keine Vollbild-Refreshes)
 
   Unverändert:
-   - OTA: Web (Root) über STA-IP und dauerhaften SoftAP (192.168.4.1)
-   - Buttons: kurz / lang / doppelt -> JSON auf esp2panel/event (src="A")
-   - MQTT Sub: esp2panel/A/line/1  und  esp2panel/A/line/2
-   - Pins & Verkabelung
+   - OTA Web (Root) + dauerhafter SoftAP 192.168.4.1
+   - Buttons (kurz/lang/doppelt) senden JSON auf esp2panel/event (src="A")
+   - MQTT-Subscribe: esp2panel/A/line/1  ("Artist - Title")
+                     esp2panel/A/line/2  ("STATE XX%") -> wir ignorieren die Zahl
+   - Pins, WLAN, Broker-IP/User/Pass
 */
 
 #include <Arduino.h>
@@ -25,7 +26,7 @@
 #include <Adafruit_ST7735.h>
 
 // ---------- Version ----------
-static const char* FW_VERSION = "1.4.1";
+static const char* FW_VERSION = "1.4.2-M";
 
 // ---------- Pins ----------
 #define TFT_CS    5
@@ -41,21 +42,19 @@ static const char* FW_VERSION = "1.4.1";
 Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
 // Farben
-#define COL_BG    ST77XX_BLACK
-#define COL_TXT   ST77XX_WHITE
-#define COL_SUB   0xC618
-#define COL_OK    ST77XX_CYAN
-#define COL_PLAY  ST77XX_GREEN
-#define COL_PAUSE ST77XX_YELLOW
-#define COL_ERR   ST77XX_RED
-#define COL_BAR   ST77XX_CYAN
-#define COL_BOX   0x18C3
+#define COL_BG      ST77XX_BLACK
+#define COL_TXT     ST77XX_WHITE
+#define COL_SUB     0xC618      // hellgrau
+#define COL_ACC     0x07E0      // Spotify-Grün
+#define COL_BADGE_P ST77XX_GREEN
+#define COL_BADGE_PA ST77XX_YELLOW
+#define COL_BADGE_S ST77XX_RED
+#define COL_HEADBG  0x0841      // dunkle Kopfzeile
 
 // ---------- WLAN / MQTT ----------
 const char* WIFI_SSID = "Peng";
 const char* WIFI_PSK  = "Keineahnung123";
 
-// MQTT-Broker per IP (wie bei dir im Netz)
 const char* MQTT_HOST = "192.168.178.65";
 const uint16_t MQTT_PORT = 1883;
 const char* MQTT_USER = "firstclass55555";
@@ -67,11 +66,16 @@ PubSubClient mqtt(wifiClient);
 // ---------- Webserver (OTA) ----------
 WebServer server(80);
 
-// Statische OTA-Upload-Seite
 static const char OTA_INDEX[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP2 MASTER OTA</title></head><body>
+<title>ESP2 MASTER OTA</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px}
+h3{margin:0 0 12px}
+form{display:flex;gap:12px;align-items:center}
+button{padding:.6em 1.2em}
+</style></head><body>
 <h3>ESP2 MASTER OTA</h3>
 <form method="POST" action="/update" enctype="multipart/form-data">
 <input type="file" name="update" accept=".bin" required>
@@ -84,7 +88,7 @@ static const char OTA_INDEX[] PROGMEM = R"HTML(
 // ---------- Buttons ----------
 struct Btn {
   uint8_t  pin;
-  bool     last;
+  bool     last;          // HIGH = released
   uint32_t lastChange;
   uint32_t lastShortRel;
   bool     pendingShort;
@@ -92,7 +96,6 @@ struct Btn {
   Btn(): pin(0), last(true), lastChange(0), lastShortRel(0), pendingShort(false) {}
 };
 enum BtnEvent { EV_NONE, EV_SHORT, EV_LONG, EV_DOUBLE };
-
 static const uint32_t DEBOUNCE_MS = 30;
 static const uint32_t LONG_MIN_MS = 700;
 static const uint32_t SHORT_MAX_MS = 300;
@@ -104,36 +107,32 @@ Btn btnL(BTN_L), btnR(BTN_R);
 String gTitle  = "-";
 String gArtist = "-";
 String gState  = "IDLE";
-int    gVol    = 0;
 
 String pTitle, pArtist, pState;
-int    pVol = -1;
 bool   mqttOk = false;
 
-// ---------- Vorwärts ----------
-void drawHeader();
-void drawFooter();
-void drawTitleArtist(bool force=false);
-void drawStateVolume(bool force=false);
+// ---------- Hilfen ----------
 inline void clearBox(int x,int y,int w,int h,uint16_t col=COL_BG){ tft.fillRect(x,y,w,h,col); }
+void wrapPrint(const String& text, int16_t x, int16_t y, int16_t maxW, uint8_t size, uint16_t col);
+
+// ---------- Vorwärts ----------
+void drawHeader(bool force=false);
+void drawFooter(bool force=false);
+void drawMain(bool force=false);
+void drawBadge(const String& state);
+void drawSpotifyGlyph(int cx, int cy, int r, uint16_t col);
 
 void mqttReconnect();
 void mqttCallback(char* topic, byte* payload, unsigned int len);
 void publishEvent(const char* btn, const char* type);
 
 // ---------- OTA-Handler ----------
-void handleRootGet() {
-  server.send_P(200, "text/html", OTA_INDEX);
-}
+void handleRootGet() { server.send_P(200, "text/html", OTA_INDEX); }
 void handleUpdatePost() {
   HTTPUpload &up = server.upload();
-  if (up.status == UPLOAD_FILE_START) {
-    Update.begin(UPDATE_SIZE_UNKNOWN);
-  } else if (up.status == UPLOAD_FILE_WRITE) {
-    Update.write(up.buf, up.currentSize);
-  } else if (up.status == UPLOAD_FILE_END) {
-    Update.end(true);
-  }
+  if (up.status == UPLOAD_FILE_START) { Update.begin(UPDATE_SIZE_UNKNOWN); }
+  else if (up.status == UPLOAD_FILE_WRITE) { Update.write(up.buf, up.currentSize); }
+  else if (up.status == UPLOAD_FILE_END) { Update.end(true); }
   if (up.status == UPLOAD_FILE_END) {
     server.sendHeader("Connection","close");
     server.send(200,"text/plain","OK");
@@ -178,92 +177,137 @@ static BtnEvent pollBtn(Btn& b){
 }
 
 // ---------- Layout ----------
-// Header: FW + MQTT
-void drawHeader(){
-  tft.fillScreen(COL_BG);
-  clearBox(0,0,128,20,COL_BG);
+// Headerleiste mit Icon + MQTT/FW
+void drawHeader(bool force){
+  static bool pOk = !mqttOk;
+  if(!force && pOk==mqttOk) return;
+
+  tft.fillRect(0,0,160,18, COL_HEADBG);
+  // Spotify-Glyph links
+  drawSpotifyGlyph(9,9,6, COL_ACC);
 
   tft.setTextWrap(false);
   tft.setTextSize(1);
-  tft.setCursor(2,3);
-  tft.setTextColor(COL_OK);  tft.print("FW:");
-  tft.setTextColor(COL_TXT); tft.print(" "); tft.print(FW_VERSION);
+  tft.setCursor(18,4);
+  tft.setTextColor(COL_TXT); tft.print("ESP2 MASTER  ");
+  tft.setTextColor(COL_SUB); tft.print("FW ");
+  tft.setTextColor(COL_TXT); tft.print(FW_VERSION);
 
-  tft.setCursor(72,3);
-  tft.setTextColor(COL_OK);  tft.print("MQTT:");
-  tft.setTextColor(mqttOk ? COL_TXT : COL_ERR);
-  tft.print(mqttOk ? " OK" : " ...");
+  tft.setCursor(112,4);
+  tft.setTextColor(COL_SUB); tft.print("MQTT ");
+  tft.setTextColor(mqttOk ? COL_TXT : COL_BADGE_S);
+  tft.print(mqttOk ? "OK" : "...");
+
+  pOk = mqttOk;
 }
 
-// Footer: STA-IP + AP-IP
-void drawFooter(){
-  clearBox(0,130,128,30,COL_BG);
+void drawFooter(bool force){
+  static String pIp = "";
+  String ip = WiFi.localIP().toString();
+  if(!force && pIp == ip) return;
+
+  clearBox(0,118,160,30, COL_BG);
   tft.setTextWrap(false);
   tft.setTextSize(1);
   tft.setTextColor(COL_SUB);
-
-  tft.setCursor(2,136);
-  tft.print("STA: "); tft.print(WiFi.localIP());
-
-  tft.setCursor(2,146);
+  tft.setCursor(2,132);
+  tft.print("STA: "); tft.print(ip);
+  tft.setCursor(2,142);
   tft.print("AP : 192.168.4.1");
+  pIp = ip;
 }
 
-// Mitte: Titel groß + Artist klein
-void drawTitleArtist(bool force){
-  if (!force && gTitle==pTitle && gArtist==pArtist) return;
+// Hauptfeld (Titel/Artist + State-Badge)
+void drawMain(bool force){
+  if(!force && gTitle==pTitle && gArtist==pArtist && gState==pState) return;
 
-  clearBox(0,24,128,48,COL_BG);
+  clearBox(0,20,160,96, COL_BG);
 
-  // Titel groß
+  // Titel groß, 2 Zeilen Wrap
   tft.setTextWrap(false);
   tft.setTextColor(COL_TXT);
-  tft.setTextSize(2);
-  tft.setCursor(2,28);
-  tft.print(gTitle);
+  wrapPrint(gTitle, 2, 24, 156, 2, COL_TXT);
 
-  // Artist klein
-  tft.setTextColor(COL_SUB);
+  // Artist klein, grau
   tft.setTextSize(1);
-  tft.setCursor(2,56);
+  tft.setTextColor(COL_SUB);
+  // Artist unter dem (möglicherweise zweizeiligen) Titel:
+  int artistY = 24 + 2*8 + 8; // grob: zwei Zeilen a 16px + Padding
+  tft.setCursor(2, artistY);
   tft.print(gArtist);
+
+  // State-Badge oben rechts
+  drawBadge(gState);
 
   pTitle = gTitle;
   pArtist = gArtist;
+  pState = gState;
 }
 
-// Statusbereich: STATE farbig + Prozent + Balken
-void drawStateVolume(bool force){
-  if (!force && gState==pState && gVol==pVol) return;
+// kleines Spotify-Icon (3 Bögen)
+void drawSpotifyGlyph(int cx, int cy, int r, uint16_t col){
+  tft.drawCircle(cx,cy,r,col);
+  // einfache "Wellen":
+  tft.drawFastHLine(cx-r+2, cy, r+2, col);
+  tft.drawFastHLine(cx-r+3, cy+2, r-1, col);
+  tft.drawFastHLine(cx-r+4, cy-2, r-3, col);
+}
 
-  clearBox(0,80,128,40,COL_BG);
+// Status-Badge
+void drawBadge(const String& state){
+  uint16_t bg = COL_BADGE_S;
+  if(state == "PLAYING") bg = COL_BADGE_P;
+  else if(state == "PAUSED") bg = COL_BADGE_PA;
 
-  uint16_t col = COL_SUB;
-  if (gState=="PLAYING") col = COL_PLAY;
-  else if (gState=="PAUSED") col = COL_PAUSE;
-  else if (gState=="STOPPED") col = COL_ERR;
-
+  // Badge-Box
+  int w = 64, h = 14, x = 160 - w - 2, y = 22;
+  tft.fillRoundRect(x,y,w,h,3,bg);
+  tft.drawRoundRect(x,y,w,h,3, COL_BG);
   tft.setTextWrap(false);
-  tft.setTextSize(2);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_BG);
+  tft.setCursor(x+6, y+4);
+  tft.print(state);
+}
+
+// Hilfsfunktion: weicher Zeilenumbruch (max. 2 Zeilen) für große Schrift
+void wrapPrint(const String& text, int16_t x, int16_t y, int16_t maxW, uint8_t size, uint16_t col){
+  tft.setTextSize(size);
   tft.setTextColor(col);
-  tft.setCursor(2,84);
-  tft.print(gState);
 
-  String vs = String(gVol) + "%";
-  int16_t x,y; uint16_t w,h;
-  tft.getTextBounds(vs.c_str(), 0,0, &x,&y,&w,&h);
-  tft.setTextColor(COL_TXT);
-  tft.setCursor(128 - w - 4, 84);
-  tft.print(vs);
+  String s = text;
+  s.trim();
 
-  int barX=4, barY=104, barW=128-8, barH=6;
-  tft.drawRect(barX-1, barY-1, barW+2, barH+2, COL_SUB);
-  int fillW = map(gVol, 0, 100, 0, barW);
-  tft.fillRect(barX, barY, barW, barH, COL_BOX);
-  tft.fillRect(barX, barY, fillW, barH, COL_BAR);
+  // erste Zeile
+  int cut = s.length();
+  while(cut>0){
+    int16_t bx,by; uint16_t bw,bh;
+    String candidate = s.substring(0,cut);
+    tft.getTextBounds(candidate, x,y, &bx,&by,&bw,&bh);
+    if(bw <= maxW) break;
+    int prevSpace = s.lastIndexOf(' ', cut-1);
+    cut = prevSpace > 0 ? prevSpace : cut-1;
+  }
+  String line1 = s.substring(0,cut);
+  tft.setCursor(x,y);
+  tft.print(line1);
 
-  pState = gState;
-  pVol   = gVol;
+  // zweite Zeile (falls Text übrig)
+  if(cut < (int)s.length()){
+    String rest = s.substring(cut);
+    rest.trim();
+    // ggf. mit Ellipsis kürzen
+    int16_t bx,by; uint16_t bw,bh;
+    String ell = rest;
+    tft.getTextBounds(ell, x, y+16, &bx,&by,&bw,&bh);
+    while(bw > maxW && ell.length()>1){
+      ell.remove(ell.length()-1);
+      tft.getTextBounds(ell + "...", x, y+16, &bx,&by,&bw,&bh);
+      if(bw <= maxW){ ell += "..."; break; }
+    }
+    tft.setCursor(x, y+16);
+    tft.print(ell);
+  }
 }
 
 // ---------- MQTT ----------
@@ -272,31 +316,20 @@ void mqttCallback(char* topic, byte* payload, unsigned int len){
   String msg; msg.reserve(len+1);
   for (unsigned int i=0;i<len;i++) msg += (char)payload[i];
 
-  // A/line/1 -> "Artist - Title"
-  // A/line/2 -> "STATE XX%"
   if (t == "esp2panel/A/line/1"){
     int sep = msg.indexOf(" - ");
     if (sep >= 0){
       gArtist = msg.substring(0, sep);
       gTitle  = msg.substring(sep+3);
-    } else {
-      gArtist = "";
-      gTitle  = msg;
-    }
-    drawTitleArtist(false);
+    } else { gArtist = ""; gTitle = msg; }
+    drawMain(false);
   }
   else if (t == "esp2panel/A/line/2"){
+    // z.B. "PLAYING 38%" -> wir verwenden NUR den State
     String s = msg; s.trim();
     int sp = s.indexOf(' ');
-    if (sp > 0){
-      gState = s.substring(0, sp);
-      String rest = s.substring(sp+1);
-      rest.replace("%","");
-      gVol = constrain(rest.toInt(), 0, 100);
-    } else {
-      gState = s;
-    }
-    drawStateVolume(false);
+    gState = (sp > 0) ? s.substring(0, sp) : s;
+    drawMain(false);
   }
 }
 
@@ -307,10 +340,10 @@ void mqttReconnect(){
       mqtt.subscribe("esp2panel/A/line/1");
       mqtt.subscribe("esp2panel/A/line/2");
       mqttOk = true;
-      drawHeader();
+      drawHeader(true);
     } else {
       mqttOk = false;
-      drawHeader();
+      drawHeader(true);
       delay(1000);
     }
   }
@@ -320,16 +353,12 @@ void mqttReconnect(){
 void publishEvent(const char* btn, const char* type){
   String payload = String("{\"src\":\"A\",\"btn\":\"") + btn + "\",\"type\":\"" + type + "\"}";
   mqtt.publish("esp2panel/event", payload.c_str());
-
-  // Mini-Feedback unten (überschreibt Footer nicht)
-  clearBox(0,120,128,10,COL_BG);
+  // kleines Textfeedback oben unter Header
+  clearBox(2, 104, 156, 10, COL_BG);
   tft.setTextSize(1);
-  tft.setTextColor(COL_OK);
-  tft.setCursor(2,120);
-  tft.print("A ");
-  tft.print(btn);
-  tft.print(" ");
-  tft.print(type);
+  tft.setTextColor(COL_ACC);
+  tft.setCursor(2,104);
+  tft.print("A "); tft.print(btn); tft.print(" "); tft.print(type);
 }
 
 // ---------- Setup / Loop ----------
@@ -340,26 +369,24 @@ void setup(){
   // Backlight PWM
   ledcAttachPin(PIN_BL, 0);
   ledcSetup(0, 1000, 8);
-  ledcWrite(0, 200);
+  ledcWrite(0, 200); // 0..255
 
   // Display
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
   tft.fillScreen(COL_BG);
-  drawHeader();
-  drawTitleArtist(true);   // Platzhalter anzeigen
-  drawStateVolume(true);   // Platzhalter anzeigen
+  drawHeader(true);
+  drawMain(true);
+  drawFooter(true);
 
-  // WLAN: STA + SoftAP parallel (SoftAP bleibt für OTA)
+  // WLAN + SoftAP für OTA
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP("ESP2-MASTER-OTA"); // offen; AP-IP 192.168.4.1
+  WiFi.softAP("ESP2-MASTER-OTA");
   WiFi.begin(WIFI_SSID, WIFI_PSK);
 
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis()-t0 < 6000){
-    delay(150);
-  }
-  drawFooter(); // zeigt STA-IP (falls verbunden) + AP-IP
+  while (WiFi.status() != WL_CONNECTED && millis()-t0 < 6000){ delay(150); }
+  drawFooter(true);
 
   // OTA Web
   server.on("/", HTTP_GET, handleRootGet);
