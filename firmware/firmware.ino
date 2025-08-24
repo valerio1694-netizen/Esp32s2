@@ -1,8 +1,10 @@
-/*  ESP2 MASTER Panel – Layout-Update
+/*  ESP2 MASTER Panel – Layout-Update + Fix Init
     FW: 1.5.0  (nur Anzeige überarbeitet, Logik/Topics unverändert)
-    - Großer Titel + kleiner Artist
-    - Farbiger STATE + Prozent + Volumen-Balken
-    - Nur betroffene Bereiche neu zeichnen (weniger Flackern)
+
+    Topics (unverändert):
+      esp2panel/A/line/1 -> "Artist - Title"
+      esp2panel/A/line/2 -> "STATE XX%"
+    Button-Events: JSON auf "esp2panel/event"
 */
 
 #include <Arduino.h>
@@ -13,7 +15,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 
-// ===== Version / Rolle =====
+// ===== Version =====
 static const char* FW_VERSION = "1.5.0";   // MASTER
 
 // ===== Pins (deine Belegung) =====
@@ -41,7 +43,7 @@ Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 #define COL_BAR   ST77XX_CYAN
 #define COL_BOX   0x18C3
 
-// ===== WLAN / MQTT (wie besprochen) =====
+// ===== WLAN / MQTT =====
 const char* WIFI_SSID = "Peng";
 const char* WIFI_PSK  = "Keineahnung123";
 
@@ -56,13 +58,17 @@ PubSubClient mqtt(wifiClient);
 // ===== OTA Webserver (simpler HTTP Upload) =====
 WebServer server(80);
 
-// ===== Button-Engine (unverändert vom Verhalten) =====
+// ===== Button-Engine =====
 struct Btn {
-  uint8_t pin;
-  bool last = true;            // Pullup → HIGH = released
-  uint32_t lastChange = 0;
-  uint32_t lastShortRel = 0;
-  bool pendingShort = false;
+  uint8_t  pin;
+  bool     last;
+  uint32_t lastChange;
+  uint32_t lastShortRel;
+  bool     pendingShort;
+
+  // *** Fix: expliziter Konstruktor ***
+  Btn(uint8_t p): pin(p), last(true), lastChange(0), lastShortRel(0), pendingShort(false) {}
+  Btn(): pin(0), last(true), lastChange(0), lastShortRel(0), pendingShort(false) {}
 };
 enum BtnEvent { EV_NONE, EV_SHORT, EV_LONG, EV_DOUBLE };
 
@@ -71,7 +77,7 @@ static const uint32_t LONG_MIN_MS = 700;
 static const uint32_t SHORT_MAX_MS = 300;
 static const uint32_t DBL_WIN_MS  = 250;
 
-Btn btnL{BTN_L}, btnR{BTN_R};
+Btn btnL(BTN_L), btnR(BTN_R);
 
 // ===== Anzeige-Status =====
 String gTitle  = "";
@@ -93,7 +99,7 @@ void mqttReconnect();
 void mqttCallback(char* topic, byte* payload, unsigned int len);
 void publishEvent(const char* btn, const char* type);
 
-// ===== OTA Handler (einfach) =====
+// ===== OTA Handler =====
 void handleRoot(){
   server.send(200,"text/plain",String("ESP2 MASTER FW ")+FW_VERSION);
 }
@@ -304,7 +310,7 @@ void publishEvent(const char* btn, const char* type){
   String payload = String("{\"src\":\"A\",\"btn\":\"") + btn + "\",\"type\":\"" + type + "\"}";
   mqtt.publish("esp2panel/event", payload.c_str());
 
-  // kurze Bestätigung im unteren Bereich
+  // kurze Bestätigung unten
   clearBox(0,120,TFT_W,12,COL_BG);
   tft.setTextSize(1);
   tft.setTextColor(COL_OK);
