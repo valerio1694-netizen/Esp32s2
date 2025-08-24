@@ -1,12 +1,13 @@
 /*
-  ESP32-S2 MASTER — MQTT + OTA + 1 Button (FW v1.1.5)
+  ESP32-S2 MASTER — MQTT + OTA + 2 Buttons (FW v1.2.0)
   - SoftAP (OTA):      SSID ESP2_MASTER / PW flashme123
   - STA (WLAN):        SSID "Peng" / PW "Keineahnung123"
   - MQTT:              192.168.178.65:1883, User "firstclass55555", PW "Zehn+551996"
   - Publish:           esp2panel/online (LWT), esp2panel/test ("hallo" beim Boot),
-                       esp2panel/event → {"src":"A","btn":"L","type":"short|double|long"}
+                       esp2panel/event → {"src":"A","btn":"L|R","type":"short|double|long"}
   - TFT ST7735 1.8":   CS=5, DC=7, RST=6, SCK=12, MOSI=11; Backlight PWM: GPIO13
-  - Button:            GPIO8 gegen GND, Pullup, kurz/doppelt/lang, short erst nach Double-Timeout
+  - Buttons:           GPIO8 = L, GPIO9 = R (jeweils gegen GND, Pullup)
+  - Short wird erst nach Double-Timeout bestätigt; Long sofort.
 */
 
 #include <WiFi.h>
@@ -32,7 +33,7 @@ static const char* AP_SSID = "ESP2_MASTER";
 static const char* AP_PASS = "flashme123";
 
 // ---------- Version ----------
-static const char* FW_VERSION = "1.1.5";
+static const char* FW_VERSION = "1.2.0";
 
 // ---------- TFT / Pins ----------
 static const int TFT_CS=5, TFT_DC=7, TFT_RST=6, TFT_SCK=12, TFT_MOSI=11;
@@ -49,8 +50,9 @@ static const int BL_CH=0, BL_FREQ=5000, BL_RES=8;
 static uint8_t bl_level=200;
 static inline void setBL(uint8_t v){ bl_level=v; ledcWrite(BL_CH,v); }
 
-// ---------- Button (GPIO8) ----------
-static const int BTN1_PIN = 8; // gegen GND, interner Pullup
+// ---------- Buttons ----------
+static const int BTN_L_PIN = 8;  // links, gegen GND
+static const int BTN_R_PIN = 9;  // rechts, gegen GND
 
 // Zeiten (ms)
 static const uint32_t BTN_DEBOUNCE_MS   = 30;
@@ -58,17 +60,16 @@ static const uint32_t BTN_SHORT_MAX_MS  = 300;
 static const uint32_t BTN_LONG_MIN_MS   = 700;
 static const uint32_t BTN_DBL_WIN_MS    = 250;
 
-// Events als einfache Codes -> kein benutzerdefinierter Typ in Signaturen
+// Event-Codes
 static const uint8_t EV_NONE=0, EV_SHORT=1, EV_DOUBLE=2, EV_LONG=3;
 
-// interner Zustand für BTN1
-static bool     b1_last      = true;
-static bool     b1_state     = false;
-static uint32_t b1_tchg      = 0;
-static bool     b1_pressed   = false;
-static uint32_t b1_tpress    = 0;
-static bool     b1_pending   = false;
-static uint32_t b1_deadline  = 0;
+// Zustand Button L
+static bool     L_last=true,  L_state=false,  L_pressed=false,  L_pending=false;
+static uint32_t L_tchg=0,     L_tpress=0,     L_deadline=0;
+
+// Zustand Button R
+static bool     R_last=true,  R_state=false,  R_pressed=false,  R_pending=false;
+static uint32_t R_tchg=0,     R_tpress=0,     R_deadline=0;
 
 // ---------- OTA HTTP ----------
 WebServer server(80);
@@ -78,7 +79,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 body{font-family:system-ui;margin:20px} .card{max-width:520px;padding:16px;border:1px solid #ccc;border-radius:12px}
 progress{width:100%;height:16px}
 </style></head><body><div class=card>
-<h2>MASTER OTA (FW v1.1.5)</h2>
+<h2>MASTER OTA (FW v1.2.0)</h2>
 <input id=f type=file accept=".bin,application/octet-stream"><br><br>
 <button id=b>Upload</button><br><br>
 <progress id=p max=100 value=0 hidden></progress>
@@ -150,52 +151,53 @@ static void publishEvent(const char* btn, const char* type){
   drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
 }
 
-// ---------- Button-Logik (nur Builtin-Typen in Signaturen) ----------
-static void btn1Init(){
-  pinMode(BTN1_PIN, INPUT_PULLUP);
-  b1_last = digitalRead(BTN1_PIN);
-  b1_state = (b1_last==LOW);
-  b1_tchg=millis(); b1_pressed=false; b1_tpress=0;
-  b1_pending=false; b1_deadline=0;
+// ---------- Button-Helfer (nur Builtin-Typen in Signaturen) ----------
+static void btnInit(int pin, bool &last, bool &state, bool &pressed, bool &pending, uint32_t &tchg, uint32_t &tpress, uint32_t &deadline){
+  pinMode(pin, INPUT_PULLUP);
+  last = digitalRead(pin);
+  state = (last==LOW);
+  tchg = millis();
+  pressed=false; tpress=0;
+  pending=false; deadline=0;
 }
 
-// liefert EV_DOUBLE oder EV_LONG sofort; EV_SHORT erst nach btn1CheckPending()
-static uint8_t btn1Poll(){
+// liefert EV_DOUBLE oder EV_LONG sofort; EV_SHORT erst nach btnCheckPending()
+static uint8_t btnPoll(int pin, bool &last, bool &state, bool &pressed, bool &pending, uint32_t &tchg, uint32_t &tpress, uint32_t &deadline){
   uint8_t ev=EV_NONE;
-  bool raw=digitalRead(BTN1_PIN);
-  if(raw!=b1_last){ b1_last=raw; b1_tchg=millis(); }
-  if(millis()-b1_tchg < BTN_DEBOUNCE_MS) return EV_NONE;
+  bool raw=digitalRead(pin);
+  if(raw!=last){ last=raw; tchg=millis(); }
+  if(millis()-tchg < BTN_DEBOUNCE_MS) return EV_NONE;
 
   bool ns = (raw==LOW);
-  if(ns!=b1_state){
-    b1_state=ns;
-    if(b1_state){ // Press
-      b1_pressed=true; b1_tpress=millis();
-    }else{       // Release
-      if(b1_pressed){
-        uint32_t dt = millis()-b1_tpress;
+  if(ns!=state){
+    state=ns;
+    if(state){ // Press
+      pressed=true; tpress=millis();
+    }else{     // Release
+      if(pressed){
+        uint32_t dt = millis()-tpress;
         if(dt >= BTN_LONG_MIN_MS){
-          b1_pending=false;
+          pending=false;
           ev = EV_LONG;
         }else if(dt < BTN_SHORT_MAX_MS){
-          if(b1_pending){
-            b1_pending=false;
+          if(pending){
+            pending=false;
             ev = EV_DOUBLE;
           }else{
-            b1_pending = true;
-            b1_deadline = millis() + BTN_DBL_WIN_MS;
+            pending = true;
+            deadline = millis() + BTN_DBL_WIN_MS;
           }
         }
       }
-      b1_pressed=false;
+      pressed=false;
     }
   }
   return ev;
 }
 
-static uint8_t btn1CheckPending(){
-  if(b1_pending && (int32_t)(millis() - b1_deadline) >= 0){
-    b1_pending=false;
+static uint8_t btnCheckPending(bool &pending, uint32_t &deadline){
+  if(pending && (int32_t)(millis() - deadline) >= 0){
+    pending=false;
     return EV_SHORT;
   }
   return EV_NONE;
@@ -215,8 +217,9 @@ void setup(){
   tft.setRotation(1);
   drawStatus("...", "...");
 
-  // Button
-  btn1Init();
+  // Buttons initialisieren
+  btnInit(BTN_L_PIN, L_last, L_state, L_pressed, L_pending, L_tchg, L_tpress, L_deadline);
+  btnInit(BTN_R_PIN, R_last, R_state, R_pressed, R_pending, R_tchg, R_tpress, R_deadline);
 
   // Dual Mode: AP (OTA) + STA (MQTT)
   WiFi.mode(WIFI_MODE_APSTA);
@@ -248,11 +251,17 @@ void loop(){
     mqtt.loop();
   }
 
-  // Button: erst DOUBLE/LONG sofort, dann ggf. SHORT nach Timeout
-  uint8_t e = btn1Poll();
-  if(e==EV_DOUBLE) publishEvent("L","double");
-  else if(e==EV_LONG) publishEvent("L","long");
+  // Button L: erst DOUBLE/LONG sofort, dann ggf. SHORT nach Timeout
+  uint8_t eL = btnPoll(BTN_L_PIN, L_last, L_state, L_pressed, L_pending, L_tchg, L_tpress, L_deadline);
+  if(eL==EV_DOUBLE) publishEvent("L","double");
+  else if(eL==EV_LONG) publishEvent("L","long");
+  uint8_t psL = btnCheckPending(L_pending, L_deadline);
+  if(psL==EV_SHORT) publishEvent("L","short");
 
-  uint8_t ps = btn1CheckPending();
-  if(ps==EV_SHORT) publishEvent("L","short");
+  // Button R
+  uint8_t eR = btnPoll(BTN_R_PIN, R_last, R_state, R_pressed, R_pending, R_tchg, R_tpress, R_deadline);
+  if(eR==EV_DOUBLE) publishEvent("R","double");
+  else if(eR==EV_LONG) publishEvent("R","long");
+  uint8_t psR = btnCheckPending(R_pending, R_deadline);
+  if(psR==EV_SHORT) publishEvent("R","short");
 }
