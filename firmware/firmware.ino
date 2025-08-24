@@ -1,5 +1,5 @@
-/*  ESP2 MASTER Panel – Layout-Update + Fix Init
-    FW: 1.5.0  (nur Anzeige überarbeitet, Logik/Topics unverändert)
+/*  ESP2 MASTER Panel – Layout + Initial-Draw Fix
+    FW: 1.5.1  (nur Anzeige/Initialisierung angepasst, Logik/Topics unverändert)
 
     Topics (unverändert):
       esp2panel/A/line/1 -> "Artist - Title"
@@ -16,7 +16,7 @@
 #include <Adafruit_ST7735.h>
 
 // ===== Version =====
-static const char* FW_VERSION = "1.5.0";   // MASTER
+static const char* FW_VERSION = "1.5.1";   // MASTER
 
 // ===== Pins (deine Belegung) =====
 #define TFT_CS    5
@@ -66,7 +66,6 @@ struct Btn {
   uint32_t lastShortRel;
   bool     pendingShort;
 
-  // *** Fix: expliziter Konstruktor ***
   Btn(uint8_t p): pin(p), last(true), lastChange(0), lastShortRel(0), pendingShort(false) {}
   Btn(): pin(0), last(true), lastChange(0), lastShortRel(0), pendingShort(false) {}
 };
@@ -80,14 +79,15 @@ static const uint32_t DBL_WIN_MS  = 250;
 Btn btnL(BTN_L), btnR(BTN_R);
 
 // ===== Anzeige-Status =====
-String gTitle  = "";
-String gArtist = "";
+String gTitle  = "-";
+String gArtist = "-";
 String gState  = "IDLE";
 int    gVol    = 0;
 
 String pTitle, pArtist, pState;
 int    pVol = -1;
 bool   headerDrawn = false;
+bool   mqttOk = false;
 
 // ===== Prototypen =====
 void drawHeader();
@@ -169,7 +169,6 @@ static BtnEvent pollBtn(Btn& b){
 
 // ===== Layout =====
 void drawHeader(){
-  if (headerDrawn) return;
   tft.fillScreen(COL_BG);
   clearBox(0,0,TFT_W,20,COL_BG);
 
@@ -181,7 +180,8 @@ void drawHeader(){
 
   tft.setCursor(72,3);
   tft.setTextColor(COL_OK); tft.print("MQTT:");
-  tft.setTextColor(COL_TXT); tft.print(" OK");
+  tft.setTextColor(mqttOk ? COL_TXT : COL_ERR);
+  tft.print(mqttOk ? " OK" : " ...");
 
   headerDrawn = true;
 }
@@ -298,8 +298,11 @@ void mqttReconnect(){
     if (mqtt.connect(cid.c_str(), MQTT_USER, MQTT_PASS)){
       mqtt.subscribe("esp2panel/A/line/1");
       mqtt.subscribe("esp2panel/A/line/2");
-      headerDrawn = false; drawHeader();   // zeigt "MQTT: OK"
+      mqttOk = true;
+      drawHeader();
     } else {
+      mqttOk = false;
+      drawHeader();
       delay(1000);
     }
   }
@@ -335,8 +338,11 @@ void setup(){
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
   tft.fillScreen(COL_BG);
+
+  // Header & Platzhalter zeichnen (sofort etwas sehen)
   drawHeader();
-  drawFooter();
+  drawTitleArtist(true);   // <-- erzwinge Platzhalteranzeige
+  drawStateVolume(true);   // <-- erzwinge Platzhalteranzeige
 
   // WLAN
   WiFi.mode(WIFI_STA);
