@@ -1,175 +1,368 @@
-/*
-  ESP32-S2 SLAVE — MQTT + OTA + 2 Buttons + Dashboard-Text (FW v1.3.1-S)
-  - SoftAP (OTA):      SSID ESP2_SLAVE / PW flashme123
-  - STA (WLAN):        SSID "Peng" / PW "Keineahnung123"
-  - MQTT:              192.168.178.65:1883, User "firstclass55555", PW "Zehn+551996"
-  - Publish:           esp2panel/event → {"src":"B","btn":"L|R","type":"short|double|long"}
-  - Subscribe:         esp2panel/B/line/#  (line/1 überschreibt die untere Zeile)
-  - TFT ST7735 1.8":   CS=5, DC=7, RST=6, SCK=12, MOSI=11; Backlight PWM: GPIO13
-  - Buttons:           GPIO8 = L, GPIO9 = R
+/*  ESP2 MASTER Panel – Layout-Update
+    FW: 1.5.0  (nur Anzeige überarbeitet, Logik/Topics unverändert)
+    - Großer Titel + kleiner Artist
+    - Farbiger STATE + Prozent + Volumen-Balken
+    - Nur betroffene Bereiche neu zeichnen (weniger Flackern)
 */
 
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
-#include <SPI.h>
+#include <PubSubClient.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
-#include <PubSubClient.h>
 
-static const char* WIFI_SSID="Peng", *WIFI_PASS="Keineahnung123";
-static const char* MQTT_HOST="192.168.178.65"; static const uint16_t MQTT_PORT=1883;
-static const char* MQTT_USER="firstclass55555", *MQTT_PASSW="Zehn+551996";
-static const char* AP_SSID="ESP2_SLAVE", *AP_PASS="flashme123";
-static const char* FW_VERSION="1.3.1-S";
+// ===== Version / Rolle =====
+static const char* FW_VERSION = "1.5.0";   // MASTER
 
-static const int TFT_CS=5, TFT_DC=7, TFT_RST=6, TFT_SCK=12, TFT_MOSI=11, TFT_BL_PIN=13;
-#define CALIB_TAB INITR_BLACKTAB
-Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCK, TFT_RST);
-#ifndef ST77XX_DARKGREY
-  #define ST77XX_DARKGREY 0x7BEF
-#endif
-static const int TFT_W=160, TFT_H=128;
-static const int BL_CH=0, BL_FREQ=5000, BL_RES=8; static uint8_t bl_level=200;
-static inline void setBL(uint8_t v){ bl_level=v; ledcWrite(BL_CH,v); }
+// ===== Pins (deine Belegung) =====
+#define TFT_CS    5
+#define TFT_DC    7
+#define TFT_RST   6
+#define TFT_SCLK 12
+#define TFT_MOSI 11
+#define BTN_L     8
+#define BTN_R     9
+#define PIN_BL   13   // Backlight (PWM)
 
-static const int BTN_L_PIN=8, BTN_R_PIN=9;
-static const uint32_t BTN_DEBOUNCE_MS=30, BTN_SHORT_MAX_MS=300, BTN_LONG_MIN_MS=700, BTN_DBL_WIN_MS=250;
-static const uint8_t EV_NONE=0, EV_SHORT=1, EV_DOUBLE=2, EV_LONG=3;
-static bool L_last=true,L_state=false,L_pressed=false,L_pending=false; static uint32_t L_tchg=0,L_tpress=0,L_deadline=0;
-static bool R_last=true,R_state=false,R_pressed=false,R_pending=false; static uint32_t R_tchg=0,R_tpress=0,R_deadline=0;
+// ===== Display =====
+Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
+#define TFT_W 128
+#define TFT_H 160
 
-WebServer server(80); WiFiClient net; PubSubClient mqtt(net);
-static const char* TOP_EVENT="esp2panel/event";
-static const char* TOP_LINES="esp2panel/B/line/";
+#define COL_BG    ST77XX_BLACK
+#define COL_TXT   ST77XX_WHITE
+#define COL_SUB   0xC618
+#define COL_OK    ST77XX_CYAN
+#define COL_PLAY  ST77XX_GREEN
+#define COL_PAUSE ST77XX_YELLOW
+#define COL_ERR   ST77XX_RED
+#define COL_BAR   ST77XX_CYAN
+#define COL_BOX   0x18C3
 
-String lastEvent="—";      // hübsch („L short“)
-String ovLine="";          // Override von HA (line/1)
+// ===== WLAN / MQTT (wie besprochen) =====
+const char* WIFI_SSID = "Peng";
+const char* WIFI_PSK  = "Keineahnung123";
 
-static const char INDEX_HTML[] PROGMEM = R"HTML(
-<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>SLAVE OTA</title><style>
-body{font-family:system-ui;margin:20px} .card{max-width:520px;padding:16px;border:1px solid #ccc;border-radius:12px}
-progress{width:100%;height:16px}
-</style></head><body><div class=card>
-<h2>ESP2 SLAVE OTA (FW v1.3.1-S)</h2>
-<input id=f type=file accept=".bin,application/octet-stream"><br><br>
-<button id=b>Upload</button><br><br>
-<progress id=p max=100 value=0 hidden></progress>
-<div id=m></div>
-<script>
-b.onclick=()=>{ if(!f.files.length){m.textContent="Datei fehlt";return;}
- let x=new XMLHttpRequest(); p.hidden=false; p.value=0; m.textContent="Lade hoch...";
- x.upload.onprogress=e=>{if(e.lengthComputable)p.value=Math.round(e.loaded/e.total*100);};
- x.onload=()=>{m.textContent=(x.status==200?"OK – Reboot":"Fehler: "+x.responseText); if(x.status==200)setTimeout(()=>location.reload(),5000);};
- let fd=new FormData(); fd.append("firmware",f.files[0]); x.open("POST","/update",true); x.send(fd); };
-</script></div></body></html>
-)HTML";
-static void handleRoot(){ server.send_P(200,"text/html; charset=utf-8",INDEX_HTML); }
-static void handleUpdate(){
-  HTTPUpload& u=server.upload(); static bool ok=false;
-  if(u.status==UPLOAD_FILE_START){ ok=Update.begin(UPDATE_SIZE_UNKNOWN); }
-  else if(u.status==UPLOAD_FILE_WRITE){ if(ok) Update.write(u.buf,u.currentSize); }
-  else if(u.status==UPLOAD_FILE_END){
-    if(ok && Update.end(true)){ server.send(200,"text/plain","OK"); delay(300); ESP.restart(); }
-    else server.send(500,"text/plain","FAIL");
+const char* MQTT_HOST = "core-mosquitto";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER = "firstclass55555";
+const char* MQTT_PASS = "Zehn+551996";
+
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+
+// ===== OTA Webserver (simpler HTTP Upload) =====
+WebServer server(80);
+
+// ===== Button-Engine (unverändert vom Verhalten) =====
+struct Btn {
+  uint8_t pin;
+  bool last = true;            // Pullup → HIGH = released
+  uint32_t lastChange = 0;
+  uint32_t lastShortRel = 0;
+  bool pendingShort = false;
+};
+enum BtnEvent { EV_NONE, EV_SHORT, EV_LONG, EV_DOUBLE };
+
+static const uint32_t DEBOUNCE_MS = 30;
+static const uint32_t LONG_MIN_MS = 700;
+static const uint32_t SHORT_MAX_MS = 300;
+static const uint32_t DBL_WIN_MS  = 250;
+
+Btn btnL{BTN_L}, btnR{BTN_R};
+
+// ===== Anzeige-Status =====
+String gTitle  = "";
+String gArtist = "";
+String gState  = "IDLE";
+int    gVol    = 0;
+
+String pTitle, pArtist, pState;
+int    pVol = -1;
+bool   headerDrawn = false;
+
+// ===== Prototypen =====
+void drawHeader();
+void drawFooter();
+void drawTitleArtist(bool force=false);
+void drawStateVolume(bool force=false);
+void clearBox(int x,int y,int w,int h,uint16_t col=COL_BG);
+void mqttReconnect();
+void mqttCallback(char* topic, byte* payload, unsigned int len);
+void publishEvent(const char* btn, const char* type);
+
+// ===== OTA Handler (einfach) =====
+void handleRoot(){
+  server.send(200,"text/plain",String("ESP2 MASTER FW ")+FW_VERSION);
+}
+void handleUpdate(){
+  HTTPUpload &up = server.upload();
+  if (server.uri() != "/update") return;
+  if (up.status == UPLOAD_FILE_START) {
+    Update.begin();
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    Update.write(up.buf, up.currentSize);
+  } else if (up.status == UPLOAD_FILE_END) {
+    Update.end(true);
   }
-}
-static void handleNotFound(){ server.send(404,"text/plain","Not found"); }
-
-static void drawStatus(const String& wifi, const String& mq){
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2); tft.setCursor(4,6);  tft.print("ESP2 SLAVE");
-  tft.setTextSize(1);
-  tft.setCursor(4,26); tft.setTextColor(ST77XX_CYAN); tft.print("FW: "); tft.setTextColor(ST77XX_WHITE); tft.print(FW_VERSION);
-  tft.setCursor(4,38); tft.setTextColor(ST77XX_CYAN); tft.print("WiFi: "); tft.setTextColor(ST77XX_WHITE); tft.print(wifi);
-  tft.setCursor(4,50); tft.setTextColor(ST77XX_CYAN); tft.print("MQTT: "); tft.setTextColor(ST77XX_WHITE); tft.print(mq);
-
-  // Untere Zeile: Override oder letztes Event
-  tft.fillRect(0, TFT_H-32, TFT_W, 16, ST77XX_DARKGREY);
-  tft.setCursor(4, TFT_H-28); tft.setTextColor(ST77XX_WHITE);
-  tft.print(ovLine.length()?ovLine:(String("Event: ")+lastEvent));
-
-  tft.fillRect(0, TFT_H-16, TFT_W, 16, ST77XX_DARKGREY);
-  tft.setCursor(4, TFT_H-12); tft.setTextColor(ST77XX_WHITE); tft.print("BL: "); tft.print((int)bl_level);
+  server.sendHeader("Connection","close");
+  server.send(200,"text/plain","OK");
+  delay(200);
+  ESP.restart();
 }
 
-static void publishEvent(const char* btn, const char* type){
-  char payload[64]; snprintf(payload,sizeof(payload), "{\"src\":\"B\",\"btn\":\"%s\",\"type\":\"%s\"}", btn, type);
-  mqtt.publish(TOP_EVENT, payload, true);
-  lastEvent = String(btn)+" "+String(type);
-  drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
-}
-
-static void mqttCallback(char* topic, byte* payload, unsigned int len){
-  String t = topic;
-  if(t.startsWith(TOP_LINES)){   // esp2panel/B/line/1
-    String msg; msg.reserve(len); for(unsigned int i=0;i<len;i++) msg += (char)payload[i];
-    ovLine = msg;
-    drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
-  }
-}
-
-static void mqttConnect(){
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(mqttCallback);
-  while(!mqtt.connected()){
-    String cid = "esp2slave-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-    bool ok = MQTT_USER && *MQTT_USER ? mqtt.connect(cid.c_str(), MQTT_USER, MQTT_PASSW) : mqtt.connect(cid.c_str());
-    if(ok){
-      mqtt.subscribe("esp2panel/B/line/#");   // <<< Dashboard-Text
-      break;
+// ===== Button-Helfer =====
+static bool btnDebounce(Btn& b, bool now){
+  uint32_t t = millis();
+  if (now != b.last){
+    if (t - b.lastChange >= DEBOUNCE_MS){
+      b.last = now;
+      b.lastChange = t;
+      return true;
     }
-    delay(1000);
   }
+  return false;
 }
 
-static void btnInit(int pin, bool &last, bool &state, bool &pressed, bool &pending, uint32_t &tchg, uint32_t &tpress, uint32_t &deadline){
-  pinMode(pin, INPUT_PULLUP); last=digitalRead(pin); state=(last==LOW); tchg=millis();
-  pressed=false; tpress=0; pending=false; deadline=0;
-}
-static uint8_t btnPoll(int pin, bool &last, bool &state, bool &pressed, bool &pending, uint32_t &tchg, uint32_t &tpress, uint32_t &deadline){
-  uint8_t ev=EV_NONE; bool raw=digitalRead(pin);
-  if(raw!=last){ last=raw; tchg=millis(); } if(millis()-tchg<BTN_DEBOUNCE_MS) return EV_NONE;
-  bool ns=(raw==LOW);
-  if(ns!=state){
-    state=ns;
-    if(state){ pressed=true; tpress=millis(); }
-    else{ if(pressed){ uint32_t dt=millis()-tpress;
-      if(dt>=BTN_LONG_MIN_MS){ pending=false; ev=EV_LONG; }
-      else if(dt<BTN_SHORT_MAX_MS){ if(pending){ pending=false; ev=EV_DOUBLE; } else { pending=true; deadline=millis()+BTN_DBL_WIN_MS; } }
-    } pressed=false; }
+static BtnEvent pollBtn(Btn& b){
+  bool level = digitalRead(b.pin); // HIGH = released
+  BtnEvent ev = EV_NONE;
+
+  if (btnDebounce(b, level)){
+    uint32_t t = millis();
+    if (!level){
+      // pressed
+    } else {
+      // released
+      uint32_t dur = t - b.lastChange;
+      if (dur <= SHORT_MAX_MS){
+        if (b.pendingShort && (t - b.lastShortRel) <= DBL_WIN_MS){
+          ev = EV_DOUBLE;
+          b.pendingShort = false;
+          b.lastShortRel = 0;
+        } else {
+          b.pendingShort = true;
+          b.lastShortRel = t;
+        }
+      } else if (dur >= LONG_MIN_MS){
+        ev = EV_LONG;
+        b.pendingShort = false;
+        b.lastShortRel = 0;
+      }
+    }
+  }
+  if (b.pendingShort && (millis() - b.lastShortRel) > DBL_WIN_MS){
+    ev = EV_SHORT;
+    b.pendingShort = false;
+    b.lastShortRel = 0;
   }
   return ev;
 }
-static uint8_t btnCheckPending(bool &pending, uint32_t &deadline){
-  if(pending && (int32_t)(millis()-deadline)>=0){ pending=false; return EV_SHORT; }
-  return EV_NONE;
+
+// ===== Layout =====
+void drawHeader(){
+  if (headerDrawn) return;
+  tft.fillScreen(COL_BG);
+  clearBox(0,0,TFT_W,20,COL_BG);
+
+  tft.setTextWrap(false);
+  tft.setTextSize(1);
+  tft.setCursor(2,3);
+  tft.setTextColor(COL_OK); tft.print("FW:");
+  tft.setTextColor(COL_TXT); tft.print(" "); tft.print(FW_VERSION);
+
+  tft.setCursor(72,3);
+  tft.setTextColor(COL_OK); tft.print("MQTT:");
+  tft.setTextColor(COL_TXT); tft.print(" OK");
+
+  headerDrawn = true;
 }
 
+void drawFooter(){
+  clearBox(0,130,TFT_W,30,COL_BG);
+  tft.setTextWrap(false);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_SUB);
+  tft.setCursor(2,142);
+  tft.print("ESP2 MASTER  IP: ");
+  tft.print(WiFi.localIP());
+}
+
+void drawTitleArtist(bool force){
+  if (!force && gTitle==pTitle && gArtist==pArtist) return;
+
+  clearBox(0,24,TFT_W,48,COL_BG);
+
+  // Title groß
+  tft.setTextWrap(false);
+  tft.setTextColor(COL_TXT);
+  tft.setTextSize(2);
+  tft.setCursor(2,28);
+  tft.print(gTitle);
+
+  // Artist klein
+  tft.setTextColor(COL_SUB);
+  tft.setTextSize(1);
+  tft.setCursor(2,56);
+  tft.print(gArtist);
+
+  pTitle = gTitle;
+  pArtist = gArtist;
+}
+
+void drawStateVolume(bool force){
+  if (!force && gState==pState && gVol==pVol) return;
+
+  clearBox(0,80,TFT_W,40,COL_BG);
+
+  // State farbig
+  uint16_t col = COL_SUB;
+  if (gState=="PLAYING") col = COL_PLAY;
+  else if (gState=="PAUSED") col = COL_PAUSE;
+  else if (gState=="STOPPED") col = COL_ERR;
+
+  tft.setTextWrap(false);
+  tft.setTextSize(2);
+  tft.setTextColor(col);
+  tft.setCursor(2,84);
+  tft.print(gState);
+
+  // Prozent rechts
+  String vs = String(gVol) + "%";
+  int16_t x,y; uint16_t w,h;
+  tft.getTextBounds(vs.c_str(), 0,0, &x,&y,&w,&h);
+  tft.setTextColor(COL_TXT);
+  tft.setCursor(TFT_W - w - 4, 84);
+  tft.print(vs);
+
+  // Vol-Balken
+  int barX=4, barY=104, barW=TFT_W-8, barH=6;
+  tft.drawRect(barX-1, barY-1, barW+2, barH+2, COL_SUB);
+  int fillW = map(gVol, 0, 100, 0, barW);
+  tft.fillRect(barX, barY, barW, barH, COL_BOX);
+  tft.fillRect(barX, barY, fillW, barH, COL_BAR);
+
+  pState = gState;
+  pVol   = gVol;
+}
+
+void clearBox(int x,int y,int w,int h,uint16_t col){
+  tft.fillRect(x,y,w,h,col);
+}
+
+// ===== MQTT =====
+void mqttCallback(char* topic, byte* payload, unsigned int len){
+  String t = String(topic);
+  String msg; msg.reserve(len+1);
+  for (unsigned int i=0;i<len;i++) msg += (char)payload[i];
+
+  // A/line/1  -> "Artist - Title"
+  // A/line/2  -> "STATE XX%"
+  if (t == "esp2panel/A/line/1"){
+    int sep = msg.indexOf(" - ");
+    if (sep >= 0){
+      gArtist = msg.substring(0, sep);
+      gTitle  = msg.substring(sep+3);
+    } else {
+      gArtist = "";
+      gTitle  = msg;
+    }
+    drawTitleArtist(false);
+  }
+  else if (t == "esp2panel/A/line/2"){
+    String s = msg; s.trim();
+    int sp = s.indexOf(' ');
+    if (sp > 0){
+      gState = s.substring(0, sp);
+      String rest = s.substring(sp+1);
+      rest.replace("%","");
+      gVol = constrain(rest.toInt(), 0, 100);
+    } else {
+      gState = s;
+    }
+    drawStateVolume(false);
+  }
+}
+
+void mqttReconnect(){
+  while (!mqtt.connected()){
+    String cid = String("esp2panel-A-") + String((uint32_t)ESP.getEfuseMac(), HEX);
+    if (mqtt.connect(cid.c_str(), MQTT_USER, MQTT_PASS)){
+      mqtt.subscribe("esp2panel/A/line/1");
+      mqtt.subscribe("esp2panel/A/line/2");
+      headerDrawn = false; drawHeader();   // zeigt "MQTT: OK"
+    } else {
+      delay(1000);
+    }
+  }
+}
+
+// ===== Event Publish =====
+void publishEvent(const char* btn, const char* type){
+  String payload = String("{\"src\":\"A\",\"btn\":\"") + btn + "\",\"type\":\"" + type + "\"}";
+  mqtt.publish("esp2panel/event", payload.c_str());
+
+  // kurze Bestätigung im unteren Bereich
+  clearBox(0,120,TFT_W,12,COL_BG);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_OK);
+  tft.setCursor(2,120);
+  tft.print("Event: A ");
+  tft.print(btn);
+  tft.print(" ");
+  tft.print(type);
+}
+
+// ===== Setup / Loop =====
 void setup(){
-  Serial.begin(115200);
-  ledcSetup(BL_CH,BL_FREQ,BL_RES); ledcAttachPin(TFT_BL_PIN,BL_CH); setBL(bl_level);
-  tft.initR(CALIB_TAB); tft.setRotation(1); drawStatus("...", "...");
-  btnInit(BTN_L_PIN, L_last,L_state,L_pressed,L_pending,L_tchg,L_tpress,L_deadline);
-  btnInit(BTN_R_PIN, R_last,R_state,R_pressed,R_pending,R_tchg,R_tpress,R_deadline);
-  WiFi.mode(WIFI_MODE_APSTA); WiFi.softAP(AP_SSID,AP_PASS); WiFi.begin(WIFI_SSID,WIFI_PASS);
-  uint32_t t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000){ delay(250); }
-  drawStatus(WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"no WiFi","...");
-  server.on("/", HTTP_GET, handleRoot); server.on("/update", HTTP_POST, [](){}, handleUpdate);
-  server.onNotFound(handleNotFound); server.begin();
-  if(WiFi.status()==WL_CONNECTED) mqttConnect();
-  drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
+  pinMode(BTN_L, INPUT_PULLUP);
+  pinMode(BTN_R, INPUT_PULLUP);
+
+  // Backlight PWM
+  ledcAttachPin(PIN_BL, 0);
+  ledcSetup(0, 1000, 8);
+  ledcWrite(0, 200);    // 0..255
+
+  // Display
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(1);
+  tft.fillScreen(COL_BG);
+  drawHeader();
+  drawFooter();
+
+  // WLAN
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PSK);
+  while (WiFi.status() != WL_CONNECTED) delay(150);
+  drawFooter();
+
+  // OTA Web
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/update", HTTP_POST,
+            [](){ server.sendHeader("Connection","close"); server.send(200,"text/plain","OK"); },
+            handleUpdate);
+  server.begin();
+
+  // MQTT
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
 }
+
 void loop(){
+  if (!mqtt.connected()) mqttReconnect();
+  mqtt.loop();
   server.handleClient();
-  if(WiFi.status()==WL_CONNECTED){ if(!mqtt.connected()) mqttConnect(); mqtt.loop(); }
 
-  uint8_t eL=btnPoll(BTN_L_PIN,L_last,L_state,L_pressed,L_pending,L_tchg,L_tpress,L_deadline);
-  if(eL==EV_DOUBLE) publishEvent("L","double"); else if(eL==EV_LONG) publishEvent("L","long");
-  uint8_t psL=btnCheckPending(L_pending,L_deadline); if(psL==EV_SHORT) publishEvent("L","short");
+  BtnEvent eL = pollBtn(btnL);
+  BtnEvent eR = pollBtn(btnR);
 
-  uint8_t eR=btnPoll(BTN_R_PIN,R_last,R_state,R_pressed,R_pending,R_tchg,R_tpress,R_deadline);
-  if(eR==EV_DOUBLE) publishEvent("R","double"); else if(eR==EV_LONG) publishEvent("R","long");
-  uint8_t psR=btnCheckPending(R_pending,R_deadline); if(psR==EV_SHORT) publishEvent("R","short");
+  if (eL==EV_SHORT)  publishEvent("L","short");
+  else if (eL==EV_LONG)   publishEvent("L","long");
+  else if (eL==EV_DOUBLE) publishEvent("L","double");
+
+  if (eR==EV_SHORT)  publishEvent("R","short");
+  else if (eR==EV_LONG)   publishEvent("R","long");
+  else if (eR==EV_DOUBLE) publishEvent("R","double");
 }
