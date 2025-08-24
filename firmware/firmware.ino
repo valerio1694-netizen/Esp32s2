@@ -1,6 +1,6 @@
 /*
   ESP2 MASTER – Layout refresh + bewährtes Web-OTA
-  FW: 1.4.1  (nur Optik; OTA/Logik wie zuvor)
+  FW: 1.4.2  (nur: MQTT_HOST auf IP gesetzt)
 
   Unverändert:
    - Pins (TFT, Buttons, BL)
@@ -20,7 +20,7 @@
 #include <Adafruit_ST7735.h>
 
 // ---------- Version ----------
-static const char* FW_VERSION = "1.4.1";   // MASTER
+static const char* FW_VERSION = "1.4.2";   // MASTER
 
 // ---------- Pins ----------
 #define TFT_CS    5
@@ -52,7 +52,8 @@ Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 const char* WIFI_SSID = "Peng";
 const char* WIFI_PSK  = "Keineahnung123";
 
-const char* MQTT_HOST = "core-mosquitto";
+// WICHTIG: nur diese Änderung (MQTT_HOST jetzt IP)
+const char* MQTT_HOST = "192.168.178.65";
 const uint16_t MQTT_PORT = 1883;
 const char* MQTT_USER = "firstclass55555";
 const char* MQTT_PASS = "Zehn+551996";
@@ -63,7 +64,7 @@ PubSubClient mqtt(wifiClient);
 // ---------- Webserver (OTA) ----------
 WebServer server(80);
 
-// Bewährte statische Upload-Seite (keine String-Konkatenation)
+// Bewährte statische Upload-Seite
 static const char OTA_INDEX[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -117,7 +118,7 @@ void mqttReconnect();
 void mqttCallback(char* topic, byte* payload, unsigned int len);
 void publishEvent(const char* btn, const char* type);
 
-// ---------- OTA-Handler (bewährte Variante) ----------
+// ---------- OTA-Handler ----------
 void handleRootGet() {
   server.send_P(200, "text/html", OTA_INDEX);
 }
@@ -310,7 +311,7 @@ void setup(){
   while (WiFi.status() != WL_CONNECTED) delay(150);
   drawFooter();
 
-  // OTA-Routen (bewährt)
+  // OTA-Routen
   server.on("/", HTTP_GET, handleRootGet);
   server.on("/update", HTTP_POST,
     [](){ server.sendHeader("Connection","close"); server.send(200,"text/plain","OK"); },
