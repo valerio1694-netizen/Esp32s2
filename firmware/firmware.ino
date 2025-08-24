@@ -1,20 +1,17 @@
 /*
   ESP32-S2 Mini – 1.8" TFT (ST7735) + 2 Buttons + OTA (AP)
-  GPIO13 = TFT-Backlight (PWM dimmbar), KEINE separate Status-LED.
+  Navigation: Schema B+ (Softkeys) mit Kurz / Lang / Doppel-Klick + Auto-Repeat
+  SPI-TFT: ST7735 (160x128), PWM-Backlight auf GPIO13, Taster auf 8/9
 
-  Pins:
-    TFT: CS=5, DC(A0)=7, RST=6, SCK=12, MOSI(SDA)=11  (MISO unbenutzt)
-    BL : 13 (PWM)
-    BTN1: 8 (gegen GND, PullUp)
-    BTN2: 9 (gegen GND, PullUp)
+  Seiten:
+    - HOME (Menü: Info / Spiele / Settings / Calib)
+    - INFO (SSID/IP/BL%)
+    - GAMES (Menü: Snake)
+    - SNAKE (spielbar, 2-Tasten-Drehsteuerung, Wrap, Highscore, Power-Ups)
+    - SETTINGS (Helligkeit regeln inkl. Auto-Repeat)
+    - CALIB (Kalibrierrahmen)
 
-  Funktionen:
-    - OTA-Weboberfläche (AP "ESP32S2-OTA", PW "flashme123")
-    - Startscreen mit SSID/IP + Live-Buttonstatus
-    - Kurz-/Langdruck-Erkennung
-    - Menü: HOME, INFO, SETTINGS, CALIB (Kalibrierbild)
-    - UI-Bausteine: HintBar, ProgressBar, Key/Value
-    - Backlight per PWM dimmbar; BTN2 kurz toggelt BL
+  OTA: AP "ESP32S2-OTA" / Passwort "flashme123", Web-Upload von .bin direkt
 */
 
 #include <WiFi.h>
@@ -23,22 +20,30 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
+#include <Preferences.h>   // für Highscore im NVS
 
 // ---------- Forward-Decl. für Arduino-Autoprototyping ----------
 enum Page : uint8_t;  // vollständige Definition weiter unten
 
-// =================== Typen ===================
+// =================== Button-Typen & Events ===================
 struct Btn {
   int pin;
   bool pullup;
-  bool state;
-  bool lastRead;
+  bool state;        // debounced
+  bool lastRead;     // raw
   uint32_t lastChange;
   bool pressedEdge;
   uint32_t pressTs;
+  // Doppelklick
+  uint32_t lastShortReleaseTs;
+  bool     pendingShort;
+  // Auto-Repeat
+  bool     repeatArmed;
+  uint32_t repeatStartTs;
+  uint32_t nextRepeatTs;
 };
 
-enum BtnEvent { EV_NONE, EV_SHORT, EV_LONG };
+enum BtnEvent { EV_NONE, EV_SHORT, EV_LONG, EV_DOUBLE, EV_REPEAT };
 
 // =================== OTA / AP ===================
 static const char* AP_SSID     = "ESP32S2-OTA";
@@ -64,7 +69,7 @@ static const int BL_PWM_RES     = 8;
 static uint8_t   bl_level       = 200; // Starthelligkeit 0..255
 static uint8_t   bl_prev_level  = 200;
 static inline void setBacklight(uint8_t lvl) { bl_level = lvl; ledcWrite(BL_PWM_CHANNEL, lvl); }
-static inline void toggleBacklight()         { if (bl_level>0){ bl_prev_level=bl_level; setBacklight(0);} else setBacklight(bl_prev_level?bl_prev_level:200); }
+static inline void toggleBacklight()         { if (bl_level>0){ bl_prev_level=bl_level; setBacklight(0);} else setBacklight(bl_prev_level?bl_prev_level:128); }
 
 // =================== Display ===================
 #define CALIB_TAB INITR_BLACKTAB
@@ -75,38 +80,46 @@ static const int TFT_H = 128;
   #define ST77XX_DARKGREY 0x7BEF
 #endif
 
-// =================== Buttons ===================
-static const uint32_t DEBOUNCE_MS   = 30;
-static const uint32_t SHORT_MS_MAX  = 300;
-static const uint32_t LONG_MS_MIN   = 700;
+// =================== Button-Parameter ===================
+static const uint32_t DEBOUNCE_MS     = 30;
+static const uint32_t SHORT_MS_MAX    = 300;
+static const uint32_t LONG_MS_MIN     = 700;
+static const uint32_t DOUBLE_WIN_MS   = 250;  // Doppelklick-Fenster
+static const uint32_t REPEAT_START_MS = 400;  // Auto-Repeat Start
+static const uint32_t REPEAT_STEP_MS  = 120;  // Auto-Repeat Rate
 
-static Btn btn1{BTN1_PIN, true, false, true, 0, false, 0};
-static Btn btn2{BTN2_PIN, true, false, true, 0, false, 0};
+static Btn btn1{BTN1_PIN, true, false, true, 0, false, 0, 0, false, false, 0, 0};
+static Btn btn2{BTN2_PIN, true, false, true, 0, false, 0, 0, false, false, 0, 0};
 
 // =================== Seiten/Status ===================
 static String apIP = "0.0.0.0";
+Preferences prefs; // NVS für Highscore
 
-// ---------- Funktions-Prototypen (nutzen ggf. Page) ----------
+// ---------- Funktions-Prototypen ----------
 static void initButton(Btn& b);
 static bool debouncedUpdate(Btn& b);
-static BtnEvent pollBtnEvent(Btn& b);
+static void armRepeatOnPress(Btn& b);
+static void disarmRepeat(Btn& b);
+static BtnEvent pollBtnEvent(Btn& b, bool repeatEnabled);
 
-static void drawHintBar(const char* text);
+static void drawSoftkeys(const char* left, const char* right);
 static void showMessage(const char* text, uint16_t color=ST77XX_WHITE, uint16_t bg=ST77XX_BLACK);
 static void printKV(int16_t x, int16_t y, const char* k, const String& v, uint16_t kc=ST77XX_YELLOW, uint16_t vc=ST77XX_WHITE);
 static void drawProgressBar(int16_t x,int16_t y,int16_t w,int16_t h,int percent);
 
 static void renderHome(bool full=true);
 static void renderInfo(bool full=true);
+static void renderGames(bool full=true);
+static void renderSnakeHUD(); // HUD für Snake
 static void renderSettings(bool full=true);
 static void renderCalib(bool full=true);
-
-static void goPage(Page p);
 
 static bool isAuthenticated();
 static void handleRoot();
 static void handleNotFound();
 static void handleUpdateUpload();
+
+static void goPage(Page p);
 
 // =================== Button-Funktionen ===================
 static void initButton(Btn& b) {
@@ -116,6 +129,11 @@ static void initButton(Btn& b) {
   b.lastChange = millis();
   b.pressedEdge = false;
   b.pressTs = 0;
+  b.lastShortReleaseTs = 0;
+  b.pendingShort = false;
+  b.repeatArmed = false;
+  b.repeatStartTs = 0;
+  b.nextRepeatTs = 0;
 }
 static bool debouncedUpdate(Btn& b) {
   bool raw = digitalRead(b.pin);
@@ -126,25 +144,70 @@ static bool debouncedUpdate(Btn& b) {
   }
   return false;
 }
-static BtnEvent pollBtnEvent(Btn& b) {
+static void armRepeatOnPress(Btn& b){
+  b.repeatArmed = true;
+  b.repeatStartTs = millis() + REPEAT_START_MS;
+  b.nextRepeatTs  = b.repeatStartTs;
+}
+static void disarmRepeat(Btn& b){
+  b.repeatArmed = false;
+  b.repeatStartTs = 0;
+  b.nextRepeatTs  = 0;
+}
+static BtnEvent pollBtnEvent(Btn& b, bool repeatEnabled) {
   BtnEvent ev = EV_NONE;
+  uint32_t now = millis();
+
   if (debouncedUpdate(b)) {
-    if (b.state) { b.pressedEdge = true; b.pressTs = millis(); }
-    else { if (b.pressedEdge) { uint32_t dt = millis() - b.pressTs;
-           if (dt < SHORT_MS_MAX) ev = EV_SHORT;
-           else if (dt >= LONG_MS_MIN) ev = EV_LONG; }
-           b.pressedEdge = false; }
-  } else if (b.state && b.pressedEdge) {
-    if (millis() - b.pressTs >= LONG_MS_MIN) { ev = EV_LONG; b.pressedEdge = false; }
+    if (b.state) {
+      // pressed edge
+      b.pressedEdge = true;
+      b.pressTs = now;
+      b.pendingShort = false;
+      if (repeatEnabled) armRepeatOnPress(b); else disarmRepeat(b);
+    } else {
+      // released edge
+      disarmRepeat(b);
+      if (b.pressedEdge) {
+        uint32_t dt = now - b.pressTs;
+        if (dt < SHORT_MS_MAX) {
+          // Kurz-Klick: Doppelklick prüfen
+          if (b.lastShortReleaseTs && (now - b.lastShortReleaseTs) <= DOUBLE_WIN_MS) {
+            ev = EV_DOUBLE;
+            b.lastShortReleaseTs = 0; // verbraucht
+          } else {
+            ev = EV_SHORT;
+            b.lastShortReleaseTs = now;
+          }
+        } else if (dt >= LONG_MS_MIN) {
+          ev = EV_LONG; // Langdruck einmalig
+        }
+      }
+      b.pressedEdge = false;
+    }
+  } else {
+    // gehalten?
+    if (b.state && b.pressedEdge) {
+      // Auto-Repeat
+      if (repeatEnabled && b.repeatArmed && now >= b.repeatStartTs) {
+        if (now >= b.nextRepeatTs) {
+          ev = EV_REPEAT;
+          b.nextRepeatTs += REPEAT_STEP_MS;
+        }
+      }
+    }
   }
   return ev;
 }
 
 // =================== UI-Bausteine ===================
-static void drawHintBar(const char* text) {
-  tft.fillRect(0, TFT_H-14, TFT_W, 14, ST77XX_DARKGREY);
+static void drawSoftkeys(const char* left, const char* right) {
+  tft.fillRect(0, TFT_H-16, TFT_W, 16, ST77XX_DARKGREY);
   tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
-  tft.setCursor(2, TFT_H-12); tft.print(text);
+  tft.setCursor(2, TFT_H-13); tft.print(left);
+  int16_t x, y; uint16_t w, h;
+  tft.getTextBounds(right, 0, 0, &x, &y, &w, &h);
+  tft.setCursor(TFT_W - 2 - w, TFT_H-13); tft.print(right);
 }
 static void showMessage(const char* text, uint16_t color, uint16_t bg) {
   tft.fillScreen(bg); tft.setTextSize(2); tft.setTextColor(color);
@@ -219,9 +282,233 @@ static void handleUpdateUpload(){
   }
 }
 
-// =================== Jetzt: enum Page-Definition & State ===================
-enum Page : uint8_t { PAGE_HOME=0, PAGE_INFO, PAGE_SETTINGS, PAGE_CALIB, PAGE_COUNT };
+// =================== enum Page & State ===================
+enum Page : uint8_t { PAGE_HOME=0, PAGE_INFO, PAGE_GAMES, PAGE_SNAKE, PAGE_SETTINGS, PAGE_CALIB, PAGE_COUNT };
 static Page currentPage = PAGE_HOME;
+
+// HOME-Menü
+static const char* HOME_ITEMS[] = { "Info", "Spiele", "Settings", "Calib" };
+static const uint8_t HOME_LEN = sizeof(HOME_ITEMS)/sizeof(HOME_ITEMS[0]);
+static int8_t homeSel = 0;
+
+// GAMES-Menü (aktuell 1 Spiel)
+static const char* GAME_ITEMS[] = { "Snake" };
+static const uint8_t GAME_LEN = sizeof(GAME_ITEMS)/sizeof(GAME_ITEMS[0]);
+static int8_t gameSel = 0;
+
+// Settings: Helligkeit
+static uint8_t pendingBL = bl_level; // Arbeitswert (Save per Doppelklick BTN2)
+
+// =================== Snake: Spiellogik ===================
+struct Cell { int8_t x, y; };
+
+// Raster / Spielfeld: oben HUD (10 px), unten Softkeys (16 px)
+static const uint8_t  SNAKE_CS   = 5;                // Zellgröße (Pixel)
+static const int16_t  HUD_H      = 10;
+static const int16_t  SOFTKEY_H  = 16;
+static const int16_t  PLAY_TOP   = HUD_H;            // y=10 .. y=111 (inkl.)
+static const int16_t  PLAY_BOTTOM= TFT_H - SOFTKEY_H;// 128-16=112 (exklusive unterer Rand)
+static const int8_t   GRID_W     = TFT_W / SNAKE_CS;                 // 160/5 = 32
+static const int8_t   GRID_H     = (PLAY_BOTTOM - PLAY_TOP) / SNAKE_CS; // (112-10)/5=20
+
+static Cell snake[ GRID_W * GRID_H ]; // max Puffer
+static int16_t snakeLen = 0;
+
+enum Dir { D_RIGHT=0, D_DOWN=1, D_LEFT=2, D_UP=3 };
+static Dir dirCur = D_RIGHT;
+
+static Cell food{0,0};
+
+// Power-Ups
+enum PillType : uint8_t { PILL_NONE=0, PILL_TURBO=1 };
+static Cell pillPos{-1,-1};
+static PillType pillType = PILL_NONE;
+static uint32_t turboUntilMs = 0; // Auto-Turbo aktiv bis Zeitstempel
+
+static bool snakeAlive = false;
+static bool snakePaused = false;
+static bool snakeTurboManual = false; // manuell per Doppelklick
+static uint16_t snakeScore = 0;
+
+static uint32_t snakeTickMs = 160; // Basis-Tick
+static uint32_t lastTick = 0;
+
+static inline int rndInt(int a, int b) { // inclusive [a,b]
+  uint32_t r = esp_random();
+  return a + (int)(r % (uint32_t)(b - a + 1));
+}
+
+static void placeFood(){
+  while (true) {
+    food.x = rndInt(0, GRID_W-1);
+    food.y = rndInt(0, GRID_H-1);
+    bool coll=false;
+    for (int i=0;i<snakeLen;i++){
+      if (snake[i].x==food.x && snake[i].y==food.y){ coll=true; break; }
+    }
+    if (!coll && !(pillType!=PILL_NONE && pillPos.x==food.x && pillPos.y==food.y)) break;
+  }
+}
+
+static void placePill(PillType type){
+  // Seltenheit: ~1/5 Chance nach Fressen
+  if (rndInt(0,4) != 0) { pillType = PILL_NONE; return; }
+  while (true) {
+    Cell p{ (int8_t)rndInt(0,GRID_W-1), (int8_t)rndInt(0,GRID_H-1) };
+    bool coll=false;
+    if (p.x==food.x && p.y==food.y) coll=true;
+    for (int i=0;i<snakeLen;i++){
+      if (snake[i].x==p.x && snake[i].y==p.y){ coll=true; break; }
+    }
+    if (!coll) { pillPos = p; pillType = type; break; }
+  }
+}
+
+static void snakeInit(){
+  snakeLen = 4;
+  int8_t startX = GRID_W/2 - 2;
+  int8_t startY = GRID_H/2;
+  for (int i=0;i<snakeLen;i++){
+    snake[i] = { (int8_t)(startX+i), startY };
+  }
+  dirCur = D_RIGHT;
+  snakeAlive = true;
+  snakePaused = false;
+  snakeTurboManual = false;
+  snakeScore = 0;
+  snakeTickMs = 160;
+  lastTick = millis();
+  turboUntilMs = 0;
+
+  // Food & Pillen
+  pillType = PILL_NONE; pillPos = {-1,-1};
+  placeFood();
+
+  // Voll-Redraw
+  tft.fillRect(0, 0, TFT_W, PLAY_BOTTOM, ST77XX_BLACK);
+  renderSnakeHUD();
+  drawSoftkeys("Pause/Back", "L/R/Turbo");
+  // Feld komplett zeichnen
+  for (int i=0;i<snakeLen;i++){
+    int16_t x = snake[i].x*SNAKE_CS;
+    int16_t y = PLAY_TOP + snake[i].y*SNAKE_CS;
+    tft.fillRect(x, y, SNAKE_CS, SNAKE_CS, (i==snakeLen-1)?ST77XX_GREEN:ST77XX_BLUE);
+  }
+  // Food
+  tft.fillRect(food.x*SNAKE_CS, PLAY_TOP+food.y*SNAKE_CS, SNAKE_CS, SNAKE_CS, ST77XX_RED);
+}
+
+static void renderSnakeHUD(){
+  // Obere HUD-Zeile
+  tft.fillRect(0, 0, TFT_W, HUD_H, ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
+  tft.setCursor(2, 1);
+  tft.print("Score: "); tft.print(snakeScore);
+
+  uint32_t hiscore = prefs.getULong("hiscore", 0);
+  tft.setCursor(80,1);
+  tft.print("Hi: "); tft.print(hiscore);
+
+  // Status
+  if (snakePaused) {
+    tft.setCursor(TFT_W-50,1); tft.print("PAUSE");
+  } else {
+    bool turboActive = snakeTurboManual || (millis() < turboUntilMs);
+    if (turboActive) {
+      tft.setCursor(TFT_W-52,1); tft.print("TURBO");
+      // Restzeit bei Pillen-Turbo anzeigen
+      if (millis() < turboUntilMs) {
+        uint32_t msLeft = turboUntilMs - millis();
+        uint8_t sLeft = (msLeft+500)/1000;
+        tft.setCursor(TFT_W-20,1); tft.print(sLeft); tft.print("s");
+      }
+    }
+  }
+}
+
+static inline void drawCell(int8_t cx,int8_t cy,uint16_t col){
+  int16_t x = cx * SNAKE_CS;
+  int16_t y = PLAY_TOP + cy * SNAKE_CS;
+  if (y+SNAKE_CS > PLAY_BOTTOM) return;
+  tft.fillRect(x, y, SNAKE_CS, SNAKE_CS, col);
+}
+
+static inline void drawFood(){ drawCell(food.x, food.y, ST77XX_RED); }
+static inline void clearCell(int8_t cx,int8_t cy){ drawCell(cx, cy, ST77XX_BLACK); }
+
+static inline void drawPill(){
+  if (pillType==PILL_NONE) return;
+  // Pille als gelbes Quadrat mit weißem Rand
+  int16_t x = pillPos.x * SNAKE_CS;
+  int16_t y = PLAY_TOP + pillPos.y * SNAKE_CS;
+  tft.fillRect(x, y, SNAKE_CS, SNAKE_CS, ST77XX_YELLOW);
+  tft.drawRect(x, y, SNAKE_CS, SNAKE_CS, ST77XX_WHITE);
+}
+
+static bool snakeStep(){
+  // Kopf
+  Cell head = snake[snakeLen-1];
+
+  // Richtung anwenden
+  switch (dirCur){
+    case D_RIGHT: head.x++; break;
+    case D_LEFT:  head.x--; break;
+    case D_DOWN:  head.y++; break;
+    case D_UP:    head.y--; break;
+  }
+
+  // --- Rand-Wrap ---
+  if (head.x < 0) head.x = GRID_W-1;
+  if (head.x >= GRID_W) head.x = 0;
+  if (head.y < 0) head.y = GRID_H-1;
+  if (head.y >= GRID_H) head.y = 0;
+
+  // Kollision Eigenkörper
+  for (int i=0;i<snakeLen;i++){
+    if (snake[i].x==head.x && snake[i].y==head.y) return false;
+  }
+
+  bool grow = (head.x==food.x && head.y==food.y);
+  bool gotPill = (pillType!=PILL_NONE && head.x==pillPos.x && head.y==pillPos.y);
+
+  if (!grow){
+    // Schwanz löschen
+    clearCell(snake[0].x, snake[0].y);
+    // Shift
+    for (int i=0;i<snakeLen-1;i++) snake[i]=snake[i+1];
+    snake[snakeLen-1]=head;
+  } else {
+    // Wachsen
+    snake[snakeLen]=head; snakeLen++;
+    snakeScore += 10;
+    renderSnakeHUD();
+    placeFood();
+    // Chance auf Pille (Turbo)
+    placePill(PILL_TURBO);
+  }
+
+  // Kopf zeichnen
+  drawCell(head.x, head.y, ST77XX_GREEN);
+  // Food sicher zeichnen (falls überschrieben)
+  drawFood();
+
+  // Pillenlogik
+  if (gotPill) {
+    if (pillType==PILL_TURBO) {
+      turboUntilMs = millis() + 5000; // 5 Sekunden Turbo
+      renderSnakeHUD();
+    }
+    // Pille verbraucht
+    pillType = PILL_NONE; pillPos = {-1,-1};
+  } else if (pillType!=PILL_NONE) {
+    drawPill();
+  }
+
+  return true;
+}
+
+static void snakeRotateLeft(){ dirCur = (Dir)((dirCur + 3) % 4); } // -1 modulo 4
+static void snakeRotateRight(){ dirCur = (Dir)((dirCur + 1) % 4); }
 
 // =================== Render & Seitenwechsel ===================
 static void renderHome(bool full){
@@ -229,23 +516,17 @@ static void renderHome(bool full){
     tft.fillScreen(ST77XX_BLACK);
     tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2);
     tft.setCursor(6,6); tft.print("HOME");
-
-    tft.setTextSize(1);
-    printKV(6,30,"SSID: ", String(AP_SSID));
-    printKV(6,42,"IP  : ", apIP);
-    printKV(6,58,"BTN1: ", btn1.state ? "GEDRUECKT" : "LOS");
-    printKV(6,70,"BTN2: ", btn2.state ? "GEDRUECKT" : "LOS");
-
-    drawHintBar("BTN1: weiter  BTN2: BL toggeln | BTN2 lang: HOME");
-  } else {
-    tft.fillRect(40,58,TFT_W-46,10,ST77XX_BLACK);
-    tft.setCursor(40,58); tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
-    tft.print(btn1.state ? "GEDRUECKT" : "LOS");
-
-    tft.fillRect(40,70,TFT_W-46,10,ST77XX_BLACK);
-    tft.setCursor(40,70);
-    tft.print(btn2.state ? "GEDRUECKT" : "LOS");
   }
+  // Liste zeichnen
+  tft.setTextSize(1);
+  for(int i=0;i<HOME_LEN;i++){
+    int y = 28 + i*12;
+    tft.fillRect(6, y-1, TFT_W-12, 10, (i==homeSel)?ST77XX_BLUE:ST77XX_BLACK);
+    tft.setCursor(10, y);
+    tft.setTextColor((i==homeSel)?ST77XX_WHITE:ST77XX_CYAN);
+    tft.print(HOME_ITEMS[i]);
+  }
+  drawSoftkeys("Weiter/Zurueck", "OK/Info");
 }
 static void renderInfo(bool /*full*/){
   tft.fillScreen(ST77XX_BLACK);
@@ -253,22 +534,46 @@ static void renderInfo(bool /*full*/){
   tft.setCursor(6,6); tft.print("INFO");
 
   tft.setTextSize(1);
-  printKV(6,30,"SSID: ", String(AP_SSID));
-  printKV(6,42,"IP  : ", apIP);
+  printKV(6,30,"SSID: ", String(AP_SSID), ST77XX_YELLOW, ST77XX_WHITE);
+  printKV(6,42,"IP  : ", apIP, ST77XX_YELLOW, ST77XX_WHITE);
   int pct = (int)((bl_level*100)/255);
-  printKV(6,54,"BL  : ", String(pct)+"%");
+  printKV(6,54,"BL  : ", String(pct)+"%", ST77XX_YELLOW, ST77XX_WHITE);
 
-  drawHintBar("BTN1: weiter  BTN2: BL toggeln  BTN2 lang: HOME");
+  drawSoftkeys("Zurueck", "OK");
+}
+static void renderGames(bool full){
+  if (full){
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2);
+    tft.setCursor(6,6); tft.print("GAMES");
+  }
+  // Liste
+  tft.setTextSize(1);
+  for(int i=0;i<GAME_LEN;i++){
+    int y = 28 + i*12;
+    tft.fillRect(6, y-1, TFT_W-12, 10, (i==gameSel)?ST77XX_BLUE:ST77XX_BLACK);
+    tft.setCursor(10, y);
+    tft.setTextColor((i==gameSel)?ST77XX_WHITE:ST77XX_CYAN);
+    tft.print(GAME_ITEMS[i]);
+  }
+  drawSoftkeys("Weiter/Zurueck", "OK");
 }
 static void renderSettings(bool /*full*/){
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(2);
   tft.setCursor(6,6); tft.print("SETTINGS");
+  tft.setTextSize(1);
+  tft.setCursor(6,30); tft.setTextColor(ST77XX_WHITE);
+  tft.print("Helligkeit: ");
+  int pct = (int)((pendingBL*100)/255);
+  tft.print(pct); tft.print("%");
 
-  tft.setTextSize(1); tft.setCursor(6,32); tft.setTextColor(ST77XX_WHITE);
-  tft.print("OK: Kalibrierungsseite\nBTN1 lang: Progress-Demo");
+  // Balken
+  tft.drawRect(6, 46, TFT_W-12, 12, ST77XX_WHITE);
+  int fillw = (TFT_W-14) * pendingBL / 255;
+  tft.fillRect(7, 47, fillw, 10, ST77XX_GREEN);
 
-  drawHintBar("BTN1: weiter  BTN2: OK  BTN2 lang: HOME");
+  drawSoftkeys("- / Std.", "+ / Save");
 }
 static void renderCalib(bool /*full*/){
   tft.fillScreen(ST77XX_BLACK);
@@ -282,23 +587,26 @@ static void renderCalib(bool /*full*/){
   tft.fillRect(TFT_W-5,TFT_H-5,5,5,ST77XX_WHITE);
 
   tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(6,10); tft.print("CALIB: Pruefe, ob alles sichtbar ist.");
+  tft.setCursor(6,10); tft.print("CALIB: Rander pruefen.");
   tft.setCursor(6,24); tft.print("TAB: BLACKTAB");
 
-  drawHintBar("BTN1: weiter  BTN2: OK  BTN2 lang: HOME");
+  drawSoftkeys("Zurueck", "OK");
 }
+
 static void goPage(Page p){
   currentPage = p;
   switch(p){
-    case PAGE_HOME:     renderHome(true); break;
-    case PAGE_INFO:     renderInfo(true); break;
+    case PAGE_HOME:     renderHome(true);     break;
+    case PAGE_INFO:     renderInfo(true);     break;
+    case PAGE_GAMES:    renderGames(true);    break;
+    case PAGE_SNAKE:    snakeInit();          break;
     case PAGE_SETTINGS: renderSettings(true); break;
-    case PAGE_CALIB:    renderCalib(true); break;
+    case PAGE_CALIB:    renderCalib(true);    break;
     default: break;
   }
 }
 
-// =================== Setup / Loop ===================
+// =================== Setup ===================
 void setup() {
   Serial.begin(115200); delay(150);
 
@@ -307,14 +615,16 @@ void setup() {
   ledcAttachPin(TFT_BL_PIN, BL_PWM_CHANNEL);
   setBacklight(bl_level);
 
-  // Buttons
   initButton(btn1); initButton(btn2);
 
-  // Display
   tft.initR(CALIB_TAB);
   tft.setRotation(1);
   tft.fillScreen(ST77XX_BLACK);
   showMessage("Boot...", ST77XX_WHITE, ST77XX_BLACK);
+
+  // NVS (Highscore)
+  prefs.begin("snake", false); // RW
+  // Wenn Schlüssel nicht existiert, bleibt getULong("hiscore",0) = 0
 
   // WiFi AP + OTA
   WiFi.mode(WIFI_MODE_AP);
@@ -329,49 +639,125 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
 
-  // Startseite
   goPage(PAGE_HOME);
 }
 
+// =================== Loop ===================
 void loop() {
   server.handleClient();
 
-  BtnEvent e1 = pollBtnEvent(btn1);
-  BtnEvent e2 = pollBtnEvent(btn2);
+  // Auto-Repeat je nach Seite:
+  bool repBtn1=false, repBtn2=false;
+  switch(currentPage){
+    case PAGE_HOME:     repBtn1=true;  repBtn2=false; break; // Scroll auf BTN1
+    case PAGE_GAMES:    repBtn1=true;  repBtn2=false; break; // Scroll Game-Liste
+    case PAGE_SETTINGS: repBtn1=true;  repBtn2=true;  break; // BL -/+
+    default:            repBtn1=false; repBtn2=false; break; // INFO/CALIB/SNAKE ohne Repeat
+  }
+
+  BtnEvent e1 = pollBtnEvent(btn1, repBtn1);
+  BtnEvent e2 = pollBtnEvent(btn2, repBtn2);
+
+  // --- Seitenlogik (B+) ---
 
   if (currentPage == PAGE_HOME) {
-    renderHome(false);
-    if (e1 == EV_SHORT) { goPage(PAGE_INFO); }
-    if (e2 == EV_SHORT) { toggleBacklight(); renderHome(true); }
-    if (e1 == EV_LONG) {
-      tft.fillScreen(ST77XX_BLACK);
-      tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
-      tft.setCursor(6,6); tft.print("Progress-Demo");
-      for (int p=0; p<=100; p+=5) { drawProgressBar(10,30,TFT_W-20,14,p); delay(50); }
-      delay(300); renderHome(true);
+    if (e1 == EV_SHORT || e1 == EV_REPEAT) { homeSel = (homeSel + 1) % HOME_LEN; renderHome(false); }
+    if (e1 == EV_DOUBLE) { homeSel = (homeSel - 1 + HOME_LEN) % HOME_LEN; renderHome(false); }
+    if (e2 == EV_SHORT) {
+      if      (homeSel == 0) goPage(PAGE_INFO);
+      else if (homeSel == 1) { gameSel = 0; goPage(PAGE_GAMES); }
+      else if (homeSel == 2) { pendingBL = bl_level; goPage(PAGE_SETTINGS); }
+      else if (homeSel == 3) goPage(PAGE_CALIB);
+    }
+    if (e2 == EV_DOUBLE) {
+      // Preview rechts
+      tft.fillRect(90, 6, 64, 16, ST77XX_BLACK);
+      tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(1);
+      tft.setCursor(90, 8);  tft.print("Preview:");
+      tft.setCursor(90, 16); tft.print(HOME_ITEMS[homeSel]);
     }
     if (e2 == EV_LONG) { goPage(PAGE_HOME); }
   }
+
   else if (currentPage == PAGE_INFO) {
-    if (e1 == EV_SHORT) { goPage(PAGE_SETTINGS); }
-    if (e2 == EV_SHORT) { toggleBacklight(); renderInfo(true); }
-    if (e2 == EV_LONG)  { goPage(PAGE_HOME); }
+    if (e1 == EV_SHORT || e1 == EV_DOUBLE || e1 == EV_LONG) { goPage(PAGE_HOME); }
+    if (e2 == EV_SHORT || e2 == EV_LONG) { goPage(PAGE_HOME); }
   }
-  else if (currentPage == PAGE_SETTINGS) {
-    if (e1 == EV_SHORT) { goPage(PAGE_CALIB); }
-    if (e1 == EV_LONG) {
-      tft.fillScreen(ST77XX_BLACK);
-      tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
-      tft.setCursor(6,6); tft.print("Progress-Demo");
-      for (int p=0; p<=100; p+=5) { drawProgressBar(10,30,TFT_W-20,14,p); delay(50); }
-      delay(300); renderSettings(true);
+
+  else if (currentPage == PAGE_GAMES) {
+    if (e1 == EV_SHORT || e1 == EV_REPEAT) { gameSel = (gameSel + 1) % GAME_LEN; renderGames(false); }
+    if (e1 == EV_DOUBLE) { gameSel = (gameSel - 1 + GAME_LEN) % GAME_LEN; renderGames(false); }
+    if (e2 == EV_SHORT) {
+      if (gameSel == 0) { goPage(PAGE_SNAKE); }
     }
-    if (e2 == EV_SHORT) { goPage(PAGE_CALIB); }
-    if (e2 == EV_LONG)  { goPage(PAGE_HOME); }
+    if (e2 == EV_LONG) { goPage(PAGE_HOME); }
   }
+
+  else if (currentPage == PAGE_SETTINGS) {
+    // (- / Std.)  |  (+ / Save)
+    if (e1 == EV_SHORT || e1 == EV_REPEAT) {
+      pendingBL = (pendingBL >= 5) ? (pendingBL - 5) : 0;
+      renderSettings(false);
+      setBacklight(pendingBL); // Live-Vorschau
+    }
+    if (e1 == EV_DOUBLE) {
+      pendingBL = 128; setBacklight(pendingBL); renderSettings(false); // Standard 50%
+    }
+    if (e2 == EV_SHORT || e2 == EV_REPEAT) {
+      pendingBL = (pendingBL <= 250) ? (pendingBL + 5) : 255;
+      renderSettings(false);
+      setBacklight(pendingBL); // Live
+    }
+    if (e2 == EV_DOUBLE) { setBacklight(pendingBL); goPage(PAGE_HOME); }
+    if (e2 == EV_LONG)   { goPage(PAGE_HOME); }
+  }
+
   else if (currentPage == PAGE_CALIB) {
-    if (e1 == EV_SHORT || e2 == EV_SHORT || e2 == EV_LONG) {
+    if (e1 == EV_SHORT || e1 == EV_DOUBLE || e1 == EV_LONG ||
+        e2 == EV_SHORT || e2 == EV_DOUBLE || e2 == EV_LONG) {
       goPage(PAGE_HOME);
     }
+  }
+
+  // ---------------- SNAKE ----------------
+  else if (currentPage == PAGE_SNAKE) {
+    // Eingaben (kein Auto-Repeat)
+    if (e1 == EV_SHORT) { snakeRotateLeft(); }
+    if (e2 == EV_SHORT) { snakeRotateRight(); }
+    if (e1 == EV_LONG)  { snakePaused = !snakePaused; renderSnakeHUD(); }
+    if (e2 == EV_DOUBLE){ snakeTurboManual = !snakeTurboManual; renderSnakeHUD(); }
+    if (e2 == EV_LONG)  {
+      // Highscore speichern, falls neuer Rekord
+      uint32_t his = prefs.getULong("hiscore", 0);
+      if (snakeScore > his) prefs.putULong("hiscore", snakeScore);
+      goPage(PAGE_HOME);
+    }
+
+    // Tick
+    uint32_t now = millis();
+    bool turboActive = snakeTurboManual || (now < turboUntilMs);
+    uint32_t stepMs = turboActive ? (snakeTickMs > 40 ? snakeTickMs - 40 : 30) : snakeTickMs;
+
+    if (!snakePaused && snakeAlive && (now - lastTick) >= stepMs) {
+      lastTick = now;
+      if (!snakeStep()) {
+        snakeAlive = false;
+        // Highscore aktualisieren
+        uint32_t his = prefs.getULong("hiscore", 0);
+        if (snakeScore > his) { prefs.putULong("hiscore", snakeScore); his = snakeScore; }
+        renderSnakeHUD();
+
+        // Game Over Overlay
+        tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2);
+        tft.setCursor(20, (PLAY_TOP + (PLAY_BOTTOM-PLAY_TOP)/2)-8); tft.print("GAME OVER");
+        tft.setTextSize(1);
+        tft.setCursor(28, (PLAY_TOP + (PLAY_BOTTOM-PLAY_TOP)/2)+12);
+        tft.print("Hi: "); tft.print(his);
+        tft.setCursor(36, (PLAY_TOP + (PLAY_BOTTOM-PLAY_TOP)/2)+24); tft.print("BTN2 lang: Home");
+      }
+    }
+
+    // Pille zeichnen, falls vorhanden und evtl. übermalt
+    if (pillType!=PILL_NONE) drawPill();
   }
 }
