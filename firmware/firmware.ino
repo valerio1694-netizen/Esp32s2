@@ -1,14 +1,13 @@
 /*
-  ESP2 MASTER – Layout refresh + bewährtes Web-OTA
-  FW: 1.4.2  (nur: MQTT_HOST auf IP gesetzt)
+  ESP2 MASTER – Layout + bewährtes Web-OTA + permanenter SoftAP-OTA
+  FW: 1.4.3
+
+  Neu ggü. 1.4.2:
+   - WiFi.mode(WIFI_AP_STA) und SoftAP "ESP2-MASTER-OTA" (IP 192.168.4.1)
+   - OTA-Webseite ist über STA-IP *und* SoftAP-IP erreichbar.
 
   Unverändert:
-   - Pins (TFT, Buttons, BL)
-   - Buttons: Kurz / Lang / Doppelklick, gleiche Events & Topics
-   - MQTT:
-       Sub: esp2panel/A/line/1   -> "Artist - Title"
-       Sub: esp2panel/A/line/2   -> "STATE 42%"   (STATE=PLAYING/PAUSED/…)
-       Pub: esp2panel/event      -> {"src":"A","btn":"L|R","type":"short|long|double"}
+   - Pins, Buttons (Short/Long/Double), MQTT-Topics
 */
 
 #include <Arduino.h>
@@ -20,7 +19,7 @@
 #include <Adafruit_ST7735.h>
 
 // ---------- Version ----------
-static const char* FW_VERSION = "1.4.2";   // MASTER
+static const char* FW_VERSION = "1.4.3";   // MASTER
 
 // ---------- Pins ----------
 #define TFT_CS    5
@@ -52,7 +51,7 @@ Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 const char* WIFI_SSID = "Peng";
 const char* WIFI_PSK  = "Keineahnung123";
 
-// WICHTIG: nur diese Änderung (MQTT_HOST jetzt IP)
+// MQTT (IP direkt)
 const char* MQTT_HOST = "192.168.178.65";
 const uint16_t MQTT_PORT = 1883;
 const char* MQTT_USER = "firstclass55555";
@@ -64,7 +63,7 @@ PubSubClient mqtt(wifiClient);
 // ---------- Webserver (OTA) ----------
 WebServer server(80);
 
-// Bewährte statische Upload-Seite
+// OTA-Upload-Seite
 static const char OTA_INDEX[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -74,7 +73,7 @@ static const char OTA_INDEX[] PROGMEM = R"HTML(
 <input type="file" name="update" accept=".bin" required>
 <button type="submit">Upload & Flash</button>
 </form>
-<p>Nach Erfolg startet das Gerät automatisch neu.</p>
+<p>Erreichbar über STA-IP und SoftAP (192.168.4.1). Nach Erfolg Reboot.</p>
 </body></html>
 )HTML";
 
@@ -97,7 +96,7 @@ static const uint32_t DBL_WIN_MS  = 250;
 
 Btn btnL(BTN_L), btnR(BTN_R);
 
-// ---------- Anzeigestatus ----------
+// ---------- Anzeige-Status ----------
 String gTitle  = "-";
 String gArtist = "-";
 String gState  = "IDLE";
@@ -107,7 +106,7 @@ String pTitle, pArtist, pState;
 int    pVol = -1;
 bool   mqttOk = false;
 
-// ---------- Vorwärtsdeklarationen ----------
+// ---------- Vorneweg ----------
 void drawHeader();
 void drawFooter();
 void drawTitleArtist(bool force=false);
@@ -139,7 +138,7 @@ void handleUpdatePost() {
   }
 }
 
-// ---------- Button-Helfer ----------
+// ---------- Button-Logik ----------
 static bool btnDebounce(Btn& b, bool now){
   uint32_t t = millis();
   if (now != b.last){
@@ -157,7 +156,7 @@ static BtnEvent pollBtn(Btn& b){
 
   if (btnDebounce(b, level)){
     uint32_t t = millis();
-    if (level){ // Release-Kante
+    if (level){ // Release
       uint32_t dur = t - b.lastChange;
       if (dur <= SHORT_MAX_MS){
         if (b.pendingShort && (t - b.lastShortRel) <= DBL_WIN_MS){
@@ -196,9 +195,11 @@ void drawFooter(){
   tft.setTextWrap(false);
   tft.setTextSize(1);
   tft.setTextColor(COL_SUB);
-  tft.setCursor(2,142);
-  tft.print("ESP2 MASTER  IP: ");
+  tft.setCursor(2,136);
+  tft.print("ESP2 MASTER  STA: ");
   tft.print(WiFi.localIP());
+  tft.setCursor(2,146);
+  tft.print("OTA AP: 192.168.4.1");
 }
 void drawTitleArtist(bool force){
   if (!force && gTitle==pTitle && gArtist==pArtist) return;
@@ -297,7 +298,7 @@ void setup(){
   ledcSetup(0, 1000, 8);
   ledcWrite(0, 200);
 
-  // Display
+  // Display Grundlayout
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
   tft.fillScreen(COL_BG);
@@ -305,11 +306,17 @@ void setup(){
   drawTitleArtist(true);
   drawStateVolume(true);
 
-  // WLAN
-  WiFi.mode(WIFI_STA);
+  // WLAN: STA + AP parallel
+  WiFi.mode(WIFI_AP_STA);
+  // SoftAP (ohne Passwort, kann bei Bedarf gesetzt werden)
+  WiFi.softAP("ESP2-MASTER-OTA");
+  // STA verbinden
   WiFi.begin(WIFI_SSID, WIFI_PSK);
-  while (WiFi.status() != WL_CONNECTED) delay(150);
-  drawFooter();
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis()-t0 < 8000) {
+    delay(150);
+  }
+  drawFooter(); // zeigt STA-IP (wenn verbunden) + AP-IP fest (192.168.4.1)
 
   // OTA-Routen
   server.on("/", HTTP_GET, handleRootGet);
