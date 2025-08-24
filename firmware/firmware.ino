@@ -22,11 +22,11 @@
 #include <Adafruit_ST7735.h>
 #include <Preferences.h>
 
-// ---------- Forward-Decls, um Arduino-Autoprototyping zu befriedigen ----------
-enum Page    : uint8_t;   // Definition folgt später
-enum PillType: uint8_t;   // Definition folgt später
+// ---------- Forward-Decls (Autoprototyping) ----------
+enum Page     : uint8_t;   // folgt später
+enum PillType : uint8_t;   // folgt später
 
-// =================== Button & Events ===================
+// =================== Buttons & Events ===================
 struct Btn {
   int pin;
   bool pullup;
@@ -36,6 +36,9 @@ struct Btn {
   bool repeatArmed; uint32_t repeatStartTs; uint32_t nextRepeatTs;
 };
 enum BtnEvent { EV_NONE, EV_SHORT, EV_LONG, EV_DOUBLE, EV_REPEAT };
+
+// Neuer Repeat-Modus zur klaren Trennung von Long/Repeat
+enum RepeatMode { REP_OFF, REP_BEFORE_LONG, REP_AFTER_LONG };
 
 // =================== OTA / AP ===================
 static const char* AP_SSID     = "ESP32S2-OTA";
@@ -75,13 +78,11 @@ Preferences prefs; // NVS für Highscore
 
 // ---------- Prototypen ----------
 static void initButton(Btn& b); static bool debouncedUpdate(Btn& b);
-static void armRepeatOnPress(Btn& b); static void disarmRepeat(Btn& b);
-static BtnEvent pollBtnEvent(Btn& b, bool repeatEnabled);
+static BtnEvent pollBtnEvent(Btn& b, RepeatMode mode);
 
 static void drawSoftkeys(const char* left,const char* right);
 static void showMessage(const char* text,uint16_t color=ST77XX_WHITE,uint16_t bg=ST77XX_BLACK);
 static void printKV(int16_t x,int16_t y,const char* k,const String& v,uint16_t kc=ST77XX_YELLOW,uint16_t vc=ST77XX_WHITE);
-static void drawProgressBar(int16_t x,int16_t y,int16_t w,int16_t h,int percent);
 
 static void renderHome(bool full=true); static void renderInfo(bool full=true);
 static void renderGames(bool full=true); static void renderSnakeHUD();
@@ -107,27 +108,39 @@ static bool debouncedUpdate(Btn& b){
   }
   return false;
 }
-static void armRepeatOnPress(Btn& b){ b.repeatArmed=true; b.repeatStartTs=millis()+REPEAT_START_MS; b.nextRepeatTs=b.repeatStartTs; }
-static void disarmRepeat(Btn& b){ b.repeatArmed=false; b.repeatStartTs=0; b.nextRepeatTs=0; }
-static BtnEvent pollBtnEvent(Btn& b,bool repeatEnabled){
+static BtnEvent pollBtnEvent(Btn& b, RepeatMode mode){
   BtnEvent ev=EV_NONE; uint32_t now=millis();
-  if(debouncedUpdate(b)){
-    if(b.state){ b.pressedEdge=true; b.pressTs=now; b.pendingShort=false; if(repeatEnabled)armRepeatOnPress(b); else disarmRepeat(b); }
-    else{
-      disarmRepeat(b);
-      if(b.pressedEdge){
-        uint32_t dt=now-b.pressTs;
-        if(dt<SHORT_MS_MAX){
-          if(b.lastShortReleaseTs && (now-b.lastShortReleaseTs)<=DOUBLE_WIN_MS){ ev=EV_DOUBLE; b.lastShortReleaseTs=0; }
-          else { ev=EV_SHORT; b.lastShortReleaseTs=now; }
-        } else if(dt>=LONG_MS_MIN){ ev=EV_LONG; }
+
+  if (debouncedUpdate(b)) {
+    if (b.state) {
+      // pressed edge
+      b.pressedEdge = true; b.pressTs = now; b.pendingShort=false;
+      // Repeat-Arm abhängig vom Modus
+      if (mode == REP_BEFORE_LONG) { b.repeatArmed = true; b.repeatStartTs = now + REPEAT_START_MS; b.nextRepeatTs = b.repeatStartTs; }
+      else { b.repeatArmed=false; b.repeatStartTs=0; b.nextRepeatTs=0; }
+    } else {
+      // released edge
+      b.repeatArmed=false; b.repeatStartTs=0; b.nextRepeatTs=0;
+      if (b.pressedEdge) {
+        uint32_t dt = now - b.pressTs;
+        if (dt < SHORT_MS_MAX) {
+          if (b.lastShortReleaseTs && (now - b.lastShortReleaseTs) <= DOUBLE_WIN_MS) {
+            ev = EV_DOUBLE; b.lastShortReleaseTs = 0;
+          } else {
+            ev = EV_SHORT;  b.lastShortReleaseTs = now;
+          }
+        } else if (dt >= LONG_MS_MIN) {
+          ev = EV_LONG;   // Long on release – kein Repeat zuvor bei REP_AFTER_LONG
+        }
       }
       b.pressedEdge=false;
     }
-  } else if(b.state && b.pressedEdge){
-    if(repeatEnabled && b.repeatArmed && now>=b.repeatStartTs){
-      if(now>=b.nextRepeatTs){ ev=EV_REPEAT; b.nextRepeatTs+=REPEAT_STEP_MS; }
+  } else if (b.state && b.pressedEdge) {
+    // gehalten
+    if (mode == REP_BEFORE_LONG && b.repeatArmed && now >= b.repeatStartTs) {
+      if (now >= b.nextRepeatTs) { ev = EV_REPEAT; b.nextRepeatTs += REPEAT_STEP_MS; }
     }
+    // REP_AFTER_LONG: vor Long KEIN Repeat – exakt die gewünschte Trennung
   }
   return ev;
 }
@@ -145,11 +158,6 @@ static void showMessage(const char* text,uint16_t color,uint16_t bg){
 }
 static void printKV(int16_t x,int16_t y,const char* k,const String& v,uint16_t kc,uint16_t vc){
   tft.setTextSize(1); tft.setCursor(x,y); tft.setTextColor(kc); tft.print(k); tft.setTextColor(vc); tft.print(v);
-}
-static void drawProgressBar(int16_t x,int16_t y,int16_t w,int16_t h,int percent){
-  if(percent<0)percent=0; if(percent>100)percent=100;
-  tft.drawRect(x,y,w,h,ST77XX_WHITE);
-  int fillw=(w-2)*percent/100; tft.fillRect(x+1,y+1,fillw,h-2,ST77XX_GREEN);
 }
 
 // =================== OTA Website ===================
@@ -207,16 +215,14 @@ static int8_t gameSel=0;
 
 static uint8_t pendingBL=bl_level;
 
-// =================== Snake: Spiellogik ===================
+// =================== Snake: Spiellogik (wie zuvor) ===================
 struct Cell{ int8_t x,y; };
-
-// Raster / Spielfeld
 static const uint8_t  SNAKE_CS=5;
 static const int16_t  HUD_H=10, SOFTKEY_H=16;
 static const int16_t  PLAY_TOP=HUD_H;
 static const int16_t  PLAY_BOTTOM=TFT_H-SOFTKEY_H;
-static const int8_t   GRID_W=TFT_W/SNAKE_CS;                      // 32
-static const int8_t   GRID_H=(PLAY_BOTTOM-PLAY_TOP)/SNAKE_CS;     // 20
+static const int8_t   GRID_W=TFT_W/SNAKE_CS;
+static const int8_t   GRID_H=(PLAY_BOTTOM-PLAY_TOP)/SNAKE_CS;
 
 static Cell snake[GRID_W*GRID_H]; static int16_t snakeLen=0;
 
@@ -253,8 +259,6 @@ static void placePill(PillType type){
     if(!coll){ pillPos=p; pillType=type; break; }
   }
 }
-
-static void renderSnakeHUD();
 static inline void drawCell(int8_t cx,int8_t cy,uint16_t col){
   int16_t x=cx*SNAKE_CS; int16_t y=PLAY_TOP+cy*SNAKE_CS; if(y+SNAKE_CS>PLAY_BOTTOM) return;
   tft.fillRect(x,y,SNAKE_CS,SNAKE_CS,col);
@@ -266,7 +270,19 @@ static inline void drawPill(){
   int16_t x=pillPos.x*SNAKE_CS, y=PLAY_TOP+pillPos.y*SNAKE_CS;
   tft.fillRect(x,y,SNAKE_CS,SNAKE_CS,ST77XX_YELLOW); tft.drawRect(x,y,SNAKE_CS,SNAKE_CS,ST77XX_WHITE);
 }
-
+static void renderSnakeHUD(){
+  tft.fillRect(0,0,TFT_W,10,ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
+  tft.setCursor(2,1); tft.print("Score: "); tft.print(snakeScore);
+  uint32_t his=prefs.getULong("hiscore",0); tft.setCursor(80,1); tft.print("Hi: "); tft.print(his);
+  if(snakePaused){ tft.setCursor(TFT_W-50,1); tft.print("PAUSE"); }
+  else {
+    bool turboActive=snakeTurboManual || (millis()<turboUntilMs);
+    if(turboActive){ tft.setCursor(TFT_W-52,1); tft.print("TURBO");
+      if(millis()<turboUntilMs){ uint32_t msLeft=turboUntilMs-millis(); uint8_t sLeft=(msLeft+500)/1000; tft.setCursor(TFT_W-20,1); tft.print(sLeft); tft.print("s"); }
+    }
+  }
+}
 static void snakeInit(){
   snakeLen=4; int8_t sx=GRID_W/2-2, sy=GRID_H/2;
   for(int i=0;i<snakeLen;i++) snake[i]={ (int8_t)(sx+i), sy };
@@ -277,14 +293,12 @@ static void snakeInit(){
   tft.fillRect(0,0,TFT_W,PLAY_BOTTOM,ST77XX_BLACK);
   renderSnakeHUD(); drawSoftkeys("Pause/Back","L/R/Turbo");
 
-  // Start zeichnen
   for(int i=0;i<snakeLen;i++){
     int16_t x=snake[i].x*SNAKE_CS, y=PLAY_TOP+snake[i].y*SNAKE_CS;
     tft.fillRect(x,y,SNAKE_CS,SNAKE_CS,(i==snakeLen-1)?ST77XX_GREEN:ST77XX_BLUE);
   }
   drawFood();
 }
-
 static bool snakeStep(){
   Cell head=snake[snakeLen-1];
   switch(dirCur){ case D_RIGHT: head.x++; break; case D_LEFT: head.x--; break; case D_DOWN: head.y++; break; case D_UP: head.y--; break; }
@@ -360,19 +374,6 @@ static void renderCalib(bool){
   tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE); tft.setCursor(6,10); tft.print("CALIB: Rander pruefen."); tft.setCursor(6,24); tft.print("TAB: BLACKTAB");
   drawSoftkeys("Zurueck","OK");
 }
-static void renderSnakeHUD(){
-  tft.fillRect(0,0,TFT_W,10,ST77XX_BLACK);
-  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
-  tft.setCursor(2,1); tft.print("Score: "); tft.print(snakeScore);
-  uint32_t his=prefs.getULong("hiscore",0); tft.setCursor(80,1); tft.print("Hi: "); tft.print(his);
-  if(snakePaused){ tft.setCursor(TFT_W-50,1); tft.print("PAUSE"); }
-  else {
-    bool turboActive=snakeTurboManual || (millis()<turboUntilMs);
-    if(turboActive){ tft.setCursor(TFT_W-52,1); tft.print("TURBO");
-      if(millis()<turboUntilMs){ uint32_t msLeft=turboUntilMs-millis(); uint8_t sLeft=(msLeft+500)/1000; tft.setCursor(TFT_W-20,1); tft.print(sLeft); tft.print("s"); }
-    }
-  }
-}
 
 // =================== Seitenwechsel ===================
 static void goPage(Page p){
@@ -410,16 +411,19 @@ void setup(){
 void loop(){
   server.handleClient();
 
-  bool repBtn1=false, repBtn2=false;
+  // Button-Repeat je Seite: klar getrennt von LONG
+  RepeatMode m1=REP_OFF, m2=REP_OFF;
   switch(currentPage){
-    case PAGE_HOME:     repBtn1=true;  repBtn2=false; break;
-    case PAGE_GAMES:    repBtn1=true;  repBtn2=false; break;
-    case PAGE_SETTINGS: repBtn1=true;  repBtn2=true;  break;
-    default:            repBtn1=false; repBtn2=false; break;
+    case PAGE_HOME:     m1=REP_BEFORE_LONG; m2=REP_AFTER_LONG; break;
+    case PAGE_GAMES:    m1=REP_BEFORE_LONG; m2=REP_AFTER_LONG; break;
+    case PAGE_SETTINGS: m1=REP_BEFORE_LONG; m2=REP_AFTER_LONG; break;
+    case PAGE_SNAKE:    m1=REP_OFF;         m2=REP_OFF;         break;
+    default:            m1=REP_OFF;         m2=REP_OFF;         break;
   }
-  BtnEvent e1=pollBtnEvent(btn1,repBtn1);
-  BtnEvent e2=pollBtnEvent(btn2,repBtn2);
+  BtnEvent e1=pollBtnEvent(btn1,m1);
+  BtnEvent e2=pollBtnEvent(btn2,m2);
 
+  // --------- HOME ---------
   if(currentPage==PAGE_HOME){
     if(e1==EV_SHORT || e1==EV_REPEAT){ homeSel=(homeSel+1)%HOME_LEN; renderHome(false); }
     if(e1==EV_DOUBLE){ homeSel=(homeSel-1+HOME_LEN)%HOME_LEN; renderHome(false); }
@@ -434,27 +438,39 @@ void loop(){
       tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(1);
       tft.setCursor(90,8); tft.print("Preview:"); tft.setCursor(90,16); tft.print(HOME_ITEMS[homeSel]);
     }
-    if(e2==EV_LONG){ goPage(PAGE_HOME); }
+    if(e2==EV_LONG){ goPage(PAGE_HOME); } // global Long auf BTN2, hier ohne Effekt
   }
+
+  // --------- INFO ---------
   else if(currentPage==PAGE_INFO){
     if(e1==EV_SHORT || e1==EV_DOUBLE || e1==EV_LONG || e2==EV_SHORT || e2==EV_LONG) goPage(PAGE_HOME);
   }
+
+  // --------- GAMES (Menü) ---------
   else if(currentPage==PAGE_GAMES){
     if(e1==EV_SHORT || e1==EV_REPEAT){ gameSel=(gameSel+1)%GAME_LEN; renderGames(false); }
     if(e1==EV_DOUBLE){ gameSel=(gameSel-1+GAME_LEN)%GAME_LEN; renderGames(false); }
     if(e2==EV_SHORT){ if(gameSel==0) goPage(PAGE_SNAKE); }
     if(e2==EV_LONG){ goPage(PAGE_HOME); }
   }
+
+  // --------- SETTINGS ---------
   else if(currentPage==PAGE_SETTINGS){
+    // (- / Std.)  |  (+ / Save)
     if(e1==EV_SHORT || e1==EV_REPEAT){ pendingBL=(pendingBL>=5)?(pendingBL-5):0; renderSettings(false); setBacklight(pendingBL); }
     if(e1==EV_DOUBLE){ pendingBL=128; setBacklight(pendingBL); renderSettings(false); }
-    if(e2==EV_SHORT || e2==EV_REPEAT){ pendingBL=(pendingBL<=250)?(pendingBL+5):255; renderSettings(false); setBacklight(pendingBL); }
+    if(e2==EV_SHORT){ pendingBL=(pendingBL<=250)?(pendingBL+5):255; renderSettings(false); setBacklight(pendingBL); }
+    // IMPORTANT: BTN2 hat REP_AFTER_LONG → kein Repeat vor LONG; damit stört es Long (Home) nicht mehr
     if(e2==EV_DOUBLE){ setBacklight(pendingBL); goPage(PAGE_HOME); }
-    if(e2==EV_LONG){ goPage(PAGE_HOME); }
+    if(e2==EV_LONG){   goPage(PAGE_HOME); }
   }
+
+  // --------- CALIB ---------
   else if(currentPage==PAGE_CALIB){
     if(e1==EV_SHORT || e1==EV_DOUBLE || e1==EV_LONG || e2==EV_SHORT || e2==EV_DOUBLE || e2==EV_LONG) goPage(PAGE_HOME);
   }
+
+  // --------- SNAKE ---------
   else if(currentPage==PAGE_SNAKE){
     if(e1==EV_SHORT) snakeRotateLeft();
     if(e2==EV_SHORT) snakeRotateRight();
@@ -465,9 +481,10 @@ void loop(){
       goPage(PAGE_HOME);
     }
 
+    static uint32_t lastTick=0; // lokal hier
     uint32_t now=millis();
     bool turboActive=snakeTurboManual || (now<turboUntilMs);
-    uint32_t stepMs=turboActive ? (snakeTickMs>40?snakeTickMs-40:30) : snakeTickMs;
+    uint32_t stepMs=turboActive ? (160>40?160-40:30) : 160;
 
     if(!snakePaused && snakeAlive && (now-lastTick)>=stepMs){
       lastTick=now;
@@ -476,10 +493,10 @@ void loop(){
         uint32_t his=prefs.getULong("hiscore",0); if(snakeScore>his){ prefs.putULong("hiscore",snakeScore); his=snakeScore; }
         renderSnakeHUD();
         tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2);
-        tft.setCursor(20,(PLAY_TOP+(PLAY_BOTTOM-PLAY_TOP)/2)-8); tft.print("GAME OVER");
-        tft.setTextSize(1); tft.setCursor(28,(PLAY_TOP+(PLAY_BOTTOM-PLAY_TOP)/2)+12);
+        tft.setCursor(20,(10+(112-10)/2)-8); tft.print("GAME OVER");
+        tft.setTextSize(1); tft.setCursor(28,(10+(112-10)/2)+12);
         tft.print("Hi: "); tft.print(his);
-        tft.setCursor(36,(PLAY_TOP+(PLAY_BOTTOM-PLAY_TOP)/2)+24); tft.print("BTN2 lang: Home");
+        tft.setCursor(36,(10+(112-10)/2)+24); tft.print("BTN2 lang: Home");
       }
     }
     if(pillType!=PILL_NONE) drawPill();
