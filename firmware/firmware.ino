@@ -1,12 +1,12 @@
 /*
-  ESP32-S2 MASTER — MQTT + OTA + 1 Button (FW v1.1.0)
+  ESP32-S2 MASTER — MQTT + OTA + 1 Button (FW v1.1.1)
   - SoftAP (OTA):      SSID ESP2_MASTER / PW flashme123
   - STA (WLAN):        SSID "Peng" / PW "Keineahnung123"
   - MQTT:              192.168.178.65:1883, User "firstclass55555", PW "Zehn+551996"
-  - Publish:           esp2panel/online (LWT) und esp2panel/test ("hallo" beim Boot)
+  - Publish:           esp2panel/online (LWT), esp2panel/test ("hallo" beim Boot),
                        esp2panel/event  → JSON {"src":"A","btn":"L","type":"short|double|long"}
   - TFT:               zeigt Status + letztes Event
-  - BUTTONS:           nur BTN1 (GPIO8 gegen GND), intern Pullup, kurz/doppelt/lang, kein Auto-Repeat
+  - Button:            GPIO8 gegen GND, interner Pullup, kurz/doppelt/lang, kein Auto-Repeat
   - TFT ST7735 1.8":   CS=5, DC=7, RST=6, SCK=12, MOSI=11; Backlight PWM: GPIO13
 */
 
@@ -33,7 +33,7 @@ static const char* AP_SSID = "ESP2_MASTER";
 static const char* AP_PASS = "flashme123";
 
 // ---------- Version ----------
-static const char* FW_VERSION = "1.1.0";
+static const char* FW_VERSION = "1.1.1";
 
 // ---------- TFT / Pins ----------
 static const int TFT_CS=5, TFT_DC=7, TFT_RST=6, TFT_SCK=12, TFT_MOSI=11;
@@ -52,9 +52,23 @@ static inline void setBL(uint8_t v){ bl_level=v; ledcWrite(BL_CH,v); }
 
 // ---------- Button (nur einer in diesem Schritt) ----------
 static const int BTN1_PIN = 8; // gegen GND, interner Pullup
-struct Btn { int pin; bool pullup; bool state; bool last; uint32_t tchg; bool pressed; uint32_t tpress; uint32_t lastShortRel; };
+
+// Eindeutige Namen (nicht mit Standard-Makros kollidieren):
+static const uint32_t BTN_DEBOUNCE_MS   = 30;
+static const uint32_t BTN_SHORT_MAX_MS  = 300;
+static const uint32_t BTN_LONG_MIN_MS   = 700;
+static const uint32_t BTN_DBL_WIN_MS    = 250;
+
+struct Btn {
+  int pin; bool pullup;
+  bool state; bool last;
+  uint32_t tchg;
+  bool pressed; uint32_t tpress;
+  uint32_t lastShortRel;
+};
+
 enum BtnEvent { EV_NONE, EV_SHORT, EV_DOUBLE, EV_LONG };
-static const uint32_t DEBOUNCE=30, SHORT_MAX=300, LONG_MIN=700, DBL_WIN=250;
+
 Btn btn1{BTN1_PIN,true,false,true,0,false,0,0};
 
 static void initBtn(Btn& b){
@@ -63,26 +77,28 @@ static void initBtn(Btn& b){
   b.state = (b.pullup ? b.last==LOW : b.last==HIGH);
   b.tchg=millis(); b.pressed=false; b.tpress=0; b.lastShortRel=0;
 }
-static bool deb(Btn& b){
+
+static bool btnDebounce(Btn& b){
   bool raw=digitalRead(b.pin);
   if(raw!=b.last){ b.last=raw; b.tchg=millis(); }
-  if(millis()-b.tchg>=DEBOUNCE){
+  if(millis()-b.tchg>=BTN_DEBOUNCE_MS){
     bool ns = b.pullup ? (raw==LOW) : (raw==HIGH);
     if(ns!=b.state){ b.state=ns; return true; }
   }
   return false;
 }
+
 static BtnEvent pollBtn(Btn& b){
   BtnEvent ev=EV_NONE; uint32_t now=millis();
-  if(deb(b)){
+  if(btnDebounce(b)){
     if(b.state){ b.pressed=true; b.tpress=now; }
     else{
       if(b.pressed){
         uint32_t dt=now-b.tpress;
-        if(dt < SHORT_MAX){
-          if(b.lastShortRel && (now-b.lastShortRel)<=DBL_WIN){ ev=EV_DOUBLE; b.lastShortRel=0; }
+        if(dt < BTN_SHORT_MAX_MS){
+          if(b.lastShortRel && (now-b.lastShortRel)<=BTN_DBL_WIN_MS){ ev=EV_DOUBLE; b.lastShortRel=0; }
           else { ev=EV_SHORT; b.lastShortRel=now; }
-        } else if(dt >= LONG_MIN){ ev=EV_LONG; }
+        } else if(dt >= BTN_LONG_MIN_MS){ ev=EV_LONG; }
       }
       b.pressed=false;
     }
@@ -98,7 +114,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 body{font-family:system-ui;margin:20px} .card{max-width:520px;padding:16px;border:1px solid #ccc;border-radius:12px}
 progress{width:100%;height:16px}
 </style></head><body><div class=card>
-<h2>MASTER OTA (FW v1.1.0)</h2>
+<h2>MASTER OTA (FW v1.1.1)</h2>
 <input id=f type=file accept=".bin,application/octet-stream"><br><br>
 <button id=b>Upload</button><br><br>
 <progress id=p max=100 value=0 hidden></progress>
@@ -143,7 +159,6 @@ static void drawStatus(const String& wifi, const String& mq){
   tft.setCursor(4,54); tft.setTextColor(ST77XX_CYAN); tft.print("MQTT: "); tft.setTextColor(ST77XX_WHITE); tft.print(mq);
   tft.setCursor(4,66); tft.setTextColor(ST77XX_CYAN); tft.print("BL: "); tft.setTextColor(ST77XX_WHITE); tft.print((int)bl_level);
 
-  // Letztes Event
   tft.fillRect(0, TFT_H-22, TFT_W, 22, ST77XX_DARKGREY);
   tft.setCursor(4, TFT_H-18); tft.setTextColor(ST77XX_WHITE); tft.print("Event: "); tft.print(lastEvent);
 }
@@ -165,7 +180,6 @@ static void mqttConnect(){
 }
 
 static void publishEvent(const char* btn, const char* type){
-  // {"src":"A","btn":"L","type":"short"}
   char payload[64];
   snprintf(payload, sizeof(payload), "{\"src\":\"A\",\"btn\":\"%s\",\"type\":\"%s\"}", btn, type);
   mqtt.publish(TOP_EVENT, payload, true);
@@ -221,7 +235,6 @@ void loop(){
     mqtt.loop();
   }
 
-  // Button abfragen → Events publishen
   BtnEvent e1 = pollBtn(btn1);
   if(e1==EV_SHORT)  publishEvent("L","short");
   if(e1==EV_DOUBLE) publishEvent("L","double");
