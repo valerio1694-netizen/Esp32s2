@@ -1,11 +1,11 @@
 /*
-  ESP32-S2 MASTER — MQTT + OTA + 2 Buttons + B-Empfang (FW v1.3.0)
+  ESP32-S2 MASTER — MQTT + OTA + 2 Buttons + B-Empfang (FW v1.3.1)
   - SoftAP (OTA):      SSID ESP2_MASTER / PW flashme123
   - STA (WLAN):        SSID "Peng" / PW "Keineahnung123"
   - MQTT:              192.168.178.65:1883, User "firstclass55555", PW "Zehn+551996"
   - Publish:           esp2panel/online (LWT), esp2panel/test ("hallo" beim Boot),
                        esp2panel/event → {"src":"A","btn":"L|R","type":"short|double|long"}
-  - Subscribe:         esp2panel/event (nur Anzeige von SLAVE-Events mit src:"B")
+  - Subscribe:         esp2panel/event (zeigt Events vom SLAVE src:"B")
   - TFT ST7735 1.8":   CS=5, DC=7, RST=6, SCK=12, MOSI=11; Backlight PWM: GPIO13
   - Buttons:           GPIO8 = L, GPIO9 = R (gegen GND, Pullup)
   - Short erst nach Double-Timeout; Long sofort. Kein Auto-Repeat.
@@ -34,7 +34,7 @@ static const char* AP_SSID = "ESP2_MASTER";
 static const char* AP_PASS = "flashme123";
 
 // ---------- Version ----------
-static const char* FW_VERSION = "1.3.0";
+static const char* FW_VERSION = "1.3.1";
 
 // ---------- TFT / Pins ----------
 static const int TFT_CS=5, TFT_DC=7, TFT_RST=6, TFT_SCK=12, TFT_MOSI=11;
@@ -80,7 +80,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 body{font-family:system-ui;margin:20px} .card{max-width:520px;padding:16px;border:1px solid #ccc;border-radius:12px}
 progress{width:100%;height:16px}
 </style></head><body><div class=card>
-<h2>MASTER OTA (FW v1.3.0)</h2>
+<h2>MASTER OTA (FW v1.3.1)</h2>
 <input id=f type=file accept=".bin,application/octet-stream"><br><br>
 <button id=b>Upload</button><br><br>
 <progress id=p max=100 value=0 hidden></progress>
@@ -114,8 +114,8 @@ static const char* TOP_LWT   = "esp2panel/online";
 static const char* TOP_TEST  = "esp2panel/test";
 static const char* TOP_EVENT = "esp2panel/event";
 
-String lastEvent = "—";      // zeigt eigenes letztes Event
-String lastPeer  = "—";      // zeigt letztes Event vom SLAVE (src:"B")
+String lastEvent = "—";      // Anzeige eigene Events (hübsch: "L short")
+String lastPeer  = "—";      // Anzeige B-Events
 
 static void drawStatus(const String& wifi, const String& mq){
   tft.fillScreen(ST77XX_BLACK);
@@ -125,15 +125,12 @@ static void drawStatus(const String& wifi, const String& mq){
   tft.setCursor(4,38); tft.setTextColor(ST77XX_CYAN); tft.print("WiFi: "); tft.setTextColor(ST77XX_WHITE); tft.print(wifi);
   tft.setCursor(4,50); tft.setTextColor(ST77XX_CYAN); tft.print("MQTT: "); tft.setTextColor(ST77XX_WHITE); tft.print(mq);
 
-  // eigene Events
   tft.fillRect(0, 64, TFT_W, 16, ST77XX_DARKGREY);
   tft.setCursor(4, 68); tft.setTextColor(ST77XX_WHITE); tft.print("A: "); tft.print(lastEvent);
 
-  // Peer-Events (vom SLAVE)
   tft.fillRect(0, 84, TFT_W, 16, ST77XX_DARKGREY);
   tft.setCursor(4, 88); tft.setTextColor(ST77XX_WHITE); tft.print("B: "); tft.print(lastPeer);
 
-  // Fußzeile
   tft.fillRect(0, TFT_H-16, TFT_W, 16, ST77XX_DARKGREY);
   tft.setCursor(4, TFT_H-12); tft.setTextColor(ST77XX_WHITE); tft.print("BL: "); tft.print((int)bl_level);
 }
@@ -142,14 +139,14 @@ static void publishEvent(const char* btn, const char* type){
   char payload[64];
   snprintf(payload, sizeof(payload), "{\"src\":\"A\",\"btn\":\"%s\",\"type\":\"%s\"}", btn, type);
   mqtt.publish(TOP_EVENT, payload, true);
-  lastEvent = payload;
+  // hübsche lokale Anzeige (kein JSON mehr)
+  lastEvent = String(btn) + " " + String(type);
   drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
 }
 
-// sehr einfache Parser-Helfer (wir vermeiden JSON-Libs hier bewusst)
+// Miniparser (ohne JSON-Lib)
 static bool contains(const String& s, const char* pat){ return s.indexOf(pat) >= 0; }
 static String extractValue(const String& s, const char* key){
-  // erwartet ... "key":"VALUE" ...
   String mark="\""; mark += key; mark += "\":\"";
   int p = s.indexOf(mark);
   if(p<0) return "";
@@ -160,22 +157,14 @@ static String extractValue(const String& s, const char* key){
 }
 
 static void mqttCallback(char* topic, byte* payload, unsigned int len){
-  String t = topic;
-  if(t != TOP_EVENT) return; // nur Events interessieren
-
-  // Payload in String wandeln (klein, <64B)
+  if(String(topic) != TOP_EVENT) return;
   String msg; msg.reserve(len);
   for(unsigned int i=0;i<len;i++) msg += (char)payload[i];
-
-  // nur auf SLAVE reagieren
-  if(!contains(msg, "\"src\":\"B\"")) return;
-
-  // btn/type grob herausziehen
-  String btn  = extractValue(msg, "btn");   // "L" oder "R"
-  String type = extractValue(msg, "type");  // "short" | "double" | "long"
+  if(!contains(msg, "\"src\":\"B\"")) return;           // nur SLAVE
+  String btn  = extractValue(msg, "btn");
+  String type = extractValue(msg, "type");
   if(btn.length()==0 || type.length()==0) return;
-
-  lastPeer = btn + " " + type;   // z.B. "L double"
+  lastPeer = btn + " " + type;
   drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
 }
 
@@ -190,14 +179,14 @@ static void mqttConnect(){
     if(ok){
       mqtt.publish(TOP_LWT, "1", true);
       mqtt.publish(TOP_TEST, "hallo");
-      mqtt.subscribe(TOP_EVENT);  // <<< jetzt hören wir auf Events (A & B)
+      mqtt.subscribe(TOP_EVENT);
       break;
     }
     delay(1000);
   }
 }
 
-// ---------- Button-Helfer (Builtin-Typen in Signaturen) ----------
+// ---------- Button-Helfer ----------
 static void btnInit(int pin, bool &last, bool &state, bool &pressed, bool &pending, uint32_t &tchg, uint32_t &tpress, uint32_t &deadline){
   pinMode(pin, INPUT_PULLUP);
   last = digitalRead(pin);
@@ -222,16 +211,10 @@ static uint8_t btnPoll(int pin, bool &last, bool &state, bool &pressed, bool &pe
       if(pressed){
         uint32_t dt = millis()-tpress;
         if(dt >= BTN_LONG_MIN_MS){
-          pending=false;
-          ev = EV_LONG;
+          pending=false; ev = EV_LONG;
         }else if(dt < BTN_SHORT_MAX_MS){
-          if(pending){
-            pending=false;
-            ev = EV_DOUBLE;
-          }else{
-            pending = true;
-            deadline = millis() + BTN_DBL_WIN_MS;
-          }
+          if(pending){ pending=false; ev = EV_DOUBLE; }
+          else{ pending = true; deadline = millis() + BTN_DBL_WIN_MS; }
         }
       }
       pressed=false;
@@ -242,8 +225,7 @@ static uint8_t btnPoll(int pin, bool &last, bool &state, bool &pressed, bool &pe
 
 static uint8_t btnCheckPending(bool &pending, uint32_t &deadline){
   if(pending && (int32_t)(millis() - deadline) >= 0){
-    pending=false;
-    return EV_SHORT;
+    pending=false; return EV_SHORT;
   }
   return EV_NONE;
 }
@@ -252,37 +234,30 @@ static uint8_t btnCheckPending(bool &pending, uint32_t &deadline){
 void setup(){
   Serial.begin(115200);
 
-  // Backlight
   ledcSetup(BL_CH, BL_FREQ, BL_RES);
   ledcAttachPin(TFT_BL_PIN, BL_CH);
   setBL(bl_level);
 
-  // TFT
   tft.initR(CALIB_TAB);
   tft.setRotation(1);
   drawStatus("...", "...");
 
-  // Buttons initialisieren
   btnInit(BTN_L_PIN, L_last, L_state, L_pressed, L_pending, L_tchg, L_tpress, L_deadline);
   btnInit(BTN_R_PIN, R_last, R_state, R_pressed, R_pending, R_tchg, R_tpress, R_deadline);
 
-  // Dual Mode: AP (OTA) + STA (MQTT)
   WiFi.mode(WIFI_MODE_APSTA);
   WiFi.softAP(AP_SSID, AP_PASS);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  // auf STA warten
   uint32_t t0=millis();
   while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000){ delay(250); }
   drawStatus(WiFi.status()==WL_CONNECTED ? WiFi.localIP().toString() : "no WiFi", "...");
 
-  // OTA HTTP
   server.on("/", HTTP_GET, handleRoot);
   server.on("/update", HTTP_POST, [](){}, handleUpdate);
   server.onNotFound(handleNotFound);
   server.begin();
 
-  // MQTT
   if(WiFi.status()==WL_CONNECTED) mqttConnect();
   drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
 }
@@ -296,14 +271,12 @@ void loop(){
     mqtt.loop();
   }
 
-  // Button L
   uint8_t eL = btnPoll(BTN_L_PIN, L_last, L_state, L_pressed, L_pending, L_tchg, L_tpress, L_deadline);
   if(eL==EV_DOUBLE) publishEvent("L","double");
   else if(eL==EV_LONG) publishEvent("L","long");
   uint8_t psL = btnCheckPending(L_pending, L_deadline);
   if(psL==EV_SHORT) publishEvent("L","short");
 
-  // Button R
   uint8_t eR = btnPoll(BTN_R_PIN, R_last, R_state, R_pressed, R_pending, R_tchg, R_tpress, R_deadline);
   if(eR==EV_DOUBLE) publishEvent("R","double");
   else if(eR==EV_LONG) publishEvent("R","long");
