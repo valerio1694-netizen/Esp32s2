@@ -1,36 +1,26 @@
 /*
   ESP32-S2 Mini – 1.8" TFT (ST7735) + 2 Buttons + LED + OTA (AP)
   Pins:
-    TFT: CS=5, DC(A0)=7, RST=6, SCK=12, MOSI(SDA)=11, (MISO nicht benutzt)
+    TFT: CS=5, DC(A0)=7, RST=6, SCK=12, MOSI(SDA)=11, (MISO unbenutzt)
     LED: 13
     BTN1: 8 (gegen GND, PullUp)
     BTN2: 9 (gegen GND, PullUp)
 
-  Schritte 1–5:
-    1) Startscreen mit SSID & IP + Live-Buttonstatus
-    2) Kurz-/Langdruck-Erkennung (Kurz<300ms, Lang>700ms)
-    3) Menü: HOME, INFO, SETTINGS, CALIB (Kalibrierung als eigene Seite)
-    4) ST7735-Kalibrierung: Testbild mit Rahmen/Marken + wählbare TAB-Variante
-    5) UI-Bausteine: Hint-Bar, Progress-Bar, Key/Value, Message
-
-  Regeln lt. Vorgabe:
-    - Keine ungefragten Änderungen
-    - Immer vollständiger Sketch
-    - OTA-Weboberfläche immer enthalten
+  Schritte 1–5: Startscreen, Kurz/Langdruck, Menü (HOME/INFO/SETTINGS/CALIB),
+  Kalibrier-Testbild, UI-Bausteine (Hint-Bar, Progress-Bar, KV, Message).
 */
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
-
+#include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
-#include <SPI.h>
 
 // =================== OTA / AP ===================
 static const char* AP_SSID     = "ESP32S2-OTA";
-static const char* AP_PASSWORD = "flashme123";     // >=8 Zeichen empfohlen
-static const char* HTTP_USER   = "admin";          // leer lassen, um Basic-Auth zu deaktivieren
+static const char* AP_PASSWORD = "flashme123";
+static const char* HTTP_USER   = "admin";
 static const char* HTTP_PASS   = "esp32s2";
 
 WebServer server(80);
@@ -46,14 +36,18 @@ static const int BTN1_PIN = 8;
 static const int BTN2_PIN = 9;
 
 // =================== Display ===================
-// Wähle hier die "TAB"-Variante deines ST7735 (üblich: INITR_BLACKTAB)
-#define CALIB_TAB INITR_BLACKTAB  // möglich: INITR_BLACKTAB, INITR_GREENTAB, INITR_REDTAB
-
+// Wähle nötige "TAB"-Variante (üblich: INITR_BLACKTAB)
+#define CALIB_TAB INITR_BLACKTAB
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCK, TFT_RST);
 static const int TFT_W = 160;
 static const int TFT_H = 128;
 
-// =================== Buttons & Entprellung/Ereignisse ===================
+// Eigene Farbe, falls Lib kein DARKGREY hat
+#ifndef ST77XX_DARKGREY
+  #define ST77XX_DARKGREY 0x7BEF
+#endif
+
+// =================== Buttons ===================
 static const uint32_t DEBOUNCE_MS   = 30;
 static const uint32_t SHORT_MS_MAX  = 300;
 static const uint32_t LONG_MS_MIN   = 700;
@@ -64,7 +58,6 @@ struct Btn {
   bool state;        // debounced (true = gedrückt)
   bool lastRead;     // raw
   uint32_t lastChange;
-  // für kurz/lang
   bool pressedEdge;
   uint32_t pressTs;
 };
@@ -74,6 +67,18 @@ static Btn btn2{BTN2_PIN, true, false, true, 0, false, 0};
 
 enum BtnEvent { EV_NONE, EV_SHORT, EV_LONG };
 
+// =================== Seiten/Status (enum VOR Prototypen!) ===================
+enum Page { PAGE_HOME=0, PAGE_INFO, PAGE_SETTINGS, PAGE_CALIB, PAGE_COUNT };
+static Page currentPage = PAGE_HOME;
+
+// Vorwärtsdeklarationen (Verhindert Autoprototyping-Probleme)
+static void goPage(Page p);
+static void renderHome(bool full=true);
+static void renderInfo(bool full=true);
+static void renderSettings(bool full=true);
+static void renderCalib(bool full=true);
+
+// =================== Button-Funktionen ===================
 static void initButton(Btn& b) {
   pinMode(b.pin, b.pullup ? INPUT_PULLUP : INPUT);
   b.lastRead = digitalRead(b.pin);
@@ -93,7 +98,7 @@ static bool debouncedUpdate(Btn& b) {
     bool newState = b.pullup ? (raw == LOW) : (raw == HIGH);
     if (newState != b.state) {
       b.state = newState;
-      return true; // state changed
+      return true;
     }
   }
   return false;
@@ -103,26 +108,21 @@ static BtnEvent pollBtnEvent(Btn& b) {
   BtnEvent ev = EV_NONE;
   if (debouncedUpdate(b)) {
     if (b.state) {
-      // Edge: pressed
       b.pressedEdge = true;
       b.pressTs = millis();
     } else {
-      // Edge: released
       if (b.pressedEdge) {
         uint32_t dt = millis() - b.pressTs;
         if (dt < SHORT_MS_MAX) ev = EV_SHORT;
-        else if (dt >= LONG_MS_MIN) ev = EV_LONG; // sehr lange Haltezeit -> als lang
-        // in-between (300..699ms) wird als "keins" ignoriert
+        else if (dt >= LONG_MS_MIN) ev = EV_LONG;
       }
       b.pressedEdge = false;
     }
   } else {
-    // Long während gedrückt halten
     if (b.state && b.pressedEdge) {
       uint32_t dt = millis() - b.pressTs;
       if (dt >= LONG_MS_MIN) {
         ev = EV_LONG;
-        // Verhindern, dass mehrfach LONG feuert:
         b.pressedEdge = false;
       }
     }
@@ -164,17 +164,7 @@ static void drawProgressBar(int16_t x, int16_t y, int16_t w, int16_t h, int perc
   tft.fillRect(x+1, y+1, fillw, h-2, ST77XX_GREEN);
 }
 
-// =================== Seiten/Status ===================
-enum Page { PAGE_HOME=0, PAGE_INFO, PAGE_SETTINGS, PAGE_CALIB, PAGE_COUNT };
-static Page currentPage = PAGE_HOME;
-
-static String apIP = "0.0.0.0";
-
-static void renderHome(bool full=true);
-static void renderInfo(bool full=true);
-static void renderSettings(bool full=true);
-static void renderCalib(bool full=true);
-
+// =================== Seitenwechsel ===================
 static void goPage(Page p) {
   currentPage = p;
   switch (p) {
@@ -186,7 +176,7 @@ static void goPage(Page p) {
   }
 }
 
-// ========== OTA: Web-Seite ==========
+// =================== OTA – Website ===================
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="de"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -194,8 +184,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 <style>
 body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:20px}
 .card{max-width:520px;padding:16px;border:1px solid #ccc;border-radius:12px}
-progress{width:100%;height:16px}
-.ok{color:green}.err{color:#b00}
+progress{width:100%;height:16px}.ok{color:green}.err{color:#b00}
 </style></head><body>
 <div class="card">
 <h2>ESP32‑S2 OTA Firmware Upload</h2>
@@ -257,6 +246,8 @@ static void handleUpdateUpload() {
 }
 
 // =================== Renderfunktionen ===================
+static String apIP = "0.0.0.0";
+
 // (1) Startscreen + Live Button-Status
 static void renderHome(bool full) {
   if (full) {
@@ -285,8 +276,8 @@ static void renderHome(bool full) {
   }
 }
 
-// (INFO) – Systeminfos + LED Status
 static void renderInfo(bool full) {
+  (void)full;
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextColor(ST77XX_CYAN);
   tft.setTextSize(2);
@@ -300,8 +291,8 @@ static void renderInfo(bool full) {
   drawHintBar("BTN1: weiter  BTN2: LED toggeln  BTN2 lang: HOME");
 }
 
-// (SETTINGS) – einfache Einstellungen/Beispiel
 static void renderSettings(bool full) {
+  (void)full;
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextColor(ST77XX_YELLOW);
   tft.setTextSize(2);
@@ -316,7 +307,6 @@ static void renderSettings(bool full) {
   drawHintBar("BTN1: weiter  BTN2: OK  BTN2 lang: HOME");
 }
 
-// (CALIB) – Testbild fuer ST7735-Ausschnitt
 static void renderCalib(bool full) {
   (void)full;
   tft.fillScreen(ST77XX_BLACK);
@@ -338,32 +328,27 @@ static void renderCalib(bool full) {
   tft.print("CALIB: Pruefe, ob alles sichtbar ist.");
 
   tft.setCursor(6, 24);
-  tft.print("TAB: ");
-  tft.print("BLACKTAB"); // Hinweis im Code anpassbar (CALIB_TAB)
+  tft.print("TAB: BLACKTAB");
 
   drawHintBar("BTN1: weiter  BTN2: OK  BTN2 lang: HOME");
 }
 
-// =================== Setup/Loop ===================
+// =================== Setup / Loop ===================
 void setup() {
   Serial.begin(115200);
   delay(150);
 
-  // LED
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  // Buttons
   initButton(btn1);
   initButton(btn2);
 
-  // Display
   tft.initR(CALIB_TAB);
-  tft.setRotation(1); // Querformat (160x128)
+  tft.setRotation(1); // Querformat 160x128
   tft.fillScreen(ST77XX_BLACK);
   showMessage("Boot...", ST77XX_WHITE, ST77XX_BLACK);
 
-  // WiFi AP + OTA
   WiFi.mode(WIFI_MODE_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   IPAddress ip = WiFi.softAPIP();
@@ -377,44 +362,30 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
 
-  // Startseite
   goPage(PAGE_HOME);
 }
 
 void loop() {
   server.handleClient();
 
-  // Button-Events
   BtnEvent e1 = pollBtnEvent(btn1);
   BtnEvent e2 = pollBtnEvent(btn2);
 
-  // Live-Status auf HOME aktualisieren (ohne Voll-Redraw)
   if (currentPage == PAGE_HOME) {
-    // Bei jeder Statusänderung (egal ob Event) wird oben in debouncedUpdate schon aufgerufen,
-    // also renderHome(false) wenn state sich ändert:
-    // (Wir rufen hier konservativ bei jedem Loop einmal die Teil-Aktualisierung auf.)
     renderHome(false);
   }
 
-  // Aktionen pro Seite
   if (currentPage == PAGE_HOME) {
     if (e1 == EV_SHORT) { goPage(PAGE_INFO); }
     if (e2 == EV_SHORT) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); renderHome(true); }
     if (e1 == EV_LONG) {
-      // Progress-Demo
       tft.fillScreen(ST77XX_BLACK);
-      tft.setTextColor(ST77XX_WHITE);
-      tft.setTextSize(1);
-      tft.setCursor(6, 6);
-      tft.print("Progress-Demo");
-      for (int p = 0; p <= 100; p+=5) {
-        drawProgressBar(10, 30, TFT_W-20, 14, p);
-        delay(50);
-      }
-      delay(300);
-      renderHome(true);
+      tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
+      tft.setCursor(6, 6); tft.print("Progress-Demo");
+      for (int p = 0; p <= 100; p+=5) { drawProgressBar(10, 30, TFT_W-20, 14, p); delay(50); }
+      delay(300); renderHome(true);
     }
-    if (e2 == EV_LONG) { goPage(PAGE_HOME); } // bleibt auf HOME
+    if (e2 == EV_LONG) { goPage(PAGE_HOME); }
   }
   else if (currentPage == PAGE_INFO) {
     if (e1 == EV_SHORT) { goPage(PAGE_SETTINGS); }
@@ -424,25 +395,18 @@ void loop() {
   else if (currentPage == PAGE_SETTINGS) {
     if (e1 == EV_SHORT) { goPage(PAGE_CALIB); }
     if (e1 == EV_LONG) {
-      // Progress-Demo von SETTINGS erreichbar
       tft.fillScreen(ST77XX_BLACK);
-      tft.setTextColor(ST77XX_WHITE);
-      tft.setTextSize(1);
-      tft.setCursor(6, 6);
-      tft.print("Progress-Demo");
-      for (int p = 0; p <= 100; p+=5) {
-        drawProgressBar(10, 30, TFT_W-20, 14, p);
-        delay(50);
-      }
-      delay(300);
-      renderSettings(true);
+      tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
+      tft.setCursor(6, 6); tft.print("Progress-Demo");
+      for (int p = 0; p <= 100; p+=5) { drawProgressBar(10, 30, TFT_W-20, 14, p); delay(50); }
+      delay(300); renderSettings(true);
     }
-    if (e2 == EV_SHORT) { goPage(PAGE_CALIB); }  // OK -> Kalibrierungsseite
+    if (e2 == EV_SHORT) { goPage(PAGE_CALIB); }
     if (e2 == EV_LONG)  { goPage(PAGE_HOME); }
   }
   else if (currentPage == PAGE_CALIB) {
-    if (e1 == EV_SHORT) { goPage(PAGE_HOME); } // weiter -> HOME
-    if (e2 == EV_SHORT) { goPage(PAGE_HOME); } // OK -> HOME
+    if (e1 == EV_SHORT) { goPage(PAGE_HOME); }
+    if (e2 == EV_SHORT) { goPage(PAGE_HOME); }
     if (e2 == EV_LONG)  { goPage(PAGE_HOME); }
   }
 }
