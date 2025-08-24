@@ -1,10 +1,11 @@
 /*
-  ESP32-S2 SLAVE — MQTT + OTA + 2 Buttons (FW v1.2.0-S)
-  - SoftAP (OTA):      SSID ESP2_SLAVE / PW flashme123
+  ESP32-S2 MASTER — MQTT + OTA + 2 Buttons + B-Empfang (FW v1.3.0)
+  - SoftAP (OTA):      SSID ESP2_MASTER / PW flashme123
   - STA (WLAN):        SSID "Peng" / PW "Keineahnung123"
   - MQTT:              192.168.178.65:1883, User "firstclass55555", PW "Zehn+551996"
   - Publish:           esp2panel/online (LWT), esp2panel/test ("hallo" beim Boot),
-                       esp2panel/event → {"src":"B","btn":"L|R","type":"short|double|long"}
+                       esp2panel/event → {"src":"A","btn":"L|R","type":"short|double|long"}
+  - Subscribe:         esp2panel/event (nur Anzeige von SLAVE-Events mit src:"B")
   - TFT ST7735 1.8":   CS=5, DC=7, RST=6, SCK=12, MOSI=11; Backlight PWM: GPIO13
   - Buttons:           GPIO8 = L, GPIO9 = R (gegen GND, Pullup)
   - Short erst nach Double-Timeout; Long sofort. Kein Auto-Repeat.
@@ -29,11 +30,11 @@ static const char* MQTT_USER   = "firstclass55555";
 static const char* MQTT_PASSW  = "Zehn+551996";
 
 // ---------- OTA (AP) ----------
-static const char* AP_SSID = "ESP2_SLAVE";
+static const char* AP_SSID = "ESP2_MASTER";
 static const char* AP_PASS = "flashme123";
 
 // ---------- Version ----------
-static const char* FW_VERSION = "1.2.0-S";
+static const char* FW_VERSION = "1.3.0";
 
 // ---------- TFT / Pins ----------
 static const int TFT_CS=5, TFT_DC=7, TFT_RST=6, TFT_SCK=12, TFT_MOSI=11;
@@ -75,11 +76,11 @@ static uint32_t R_tchg=0,     R_tpress=0,     R_deadline=0;
 WebServer server(80);
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>SLAVE OTA</title><style>
+<title>MASTER OTA</title><style>
 body{font-family:system-ui;margin:20px} .card{max-width:520px;padding:16px;border:1px solid #ccc;border-radius:12px}
 progress{width:100%;height:16px}
 </style></head><body><div class=card>
-<h2>ESP2 SLAVE OTA (FW v1.2.0-S)</h2>
+<h2>MASTER OTA (FW v1.3.0)</h2>
 <input id=f type=file accept=".bin,application/octet-stream"><br><br>
 <button id=b>Upload</button><br><br>
 <progress id=p max=100 value=0 hidden></progress>
@@ -113,45 +114,90 @@ static const char* TOP_LWT   = "esp2panel/online";
 static const char* TOP_TEST  = "esp2panel/test";
 static const char* TOP_EVENT = "esp2panel/event";
 
-String lastEvent = "—";
+String lastEvent = "—";      // zeigt eigenes letztes Event
+String lastPeer  = "—";      // zeigt letztes Event vom SLAVE (src:"B")
 
 static void drawStatus(const String& wifi, const String& mq){
   tft.fillScreen(ST77XX_BLACK);
-  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2); tft.setCursor(4,6);  tft.print("ESP2 SLAVE");
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2); tft.setCursor(4,6);  tft.print("ESP2 MASTER");
   tft.setTextSize(1);
-  tft.setCursor(4,30); tft.setTextColor(ST77XX_CYAN); tft.print("FW: "); tft.setTextColor(ST77XX_WHITE); tft.print(FW_VERSION);
-  tft.setCursor(4,42); tft.setTextColor(ST77XX_CYAN); tft.print("WiFi: "); tft.setTextColor(ST77XX_WHITE); tft.print(wifi);
-  tft.setCursor(4,54); tft.setTextColor(ST77XX_CYAN); tft.print("MQTT: "); tft.setTextColor(ST77XX_WHITE); tft.print(mq);
-  tft.setCursor(4,66); tft.setTextColor(ST77XX_CYAN); tft.print("BL: "); tft.setTextColor(ST77XX_WHITE); tft.print((int)bl_level);
-  tft.fillRect(0, TFT_H-22, TFT_W, 22, ST77XX_DARKGREY);
-  tft.setCursor(4, TFT_H-18); tft.setTextColor(ST77XX_WHITE); tft.print("Event: "); tft.print(lastEvent);
+  tft.setCursor(4,26); tft.setTextColor(ST77XX_CYAN); tft.print("FW: "); tft.setTextColor(ST77XX_WHITE); tft.print(FW_VERSION);
+  tft.setCursor(4,38); tft.setTextColor(ST77XX_CYAN); tft.print("WiFi: "); tft.setTextColor(ST77XX_WHITE); tft.print(wifi);
+  tft.setCursor(4,50); tft.setTextColor(ST77XX_CYAN); tft.print("MQTT: "); tft.setTextColor(ST77XX_WHITE); tft.print(mq);
+
+  // eigene Events
+  tft.fillRect(0, 64, TFT_W, 16, ST77XX_DARKGREY);
+  tft.setCursor(4, 68); tft.setTextColor(ST77XX_WHITE); tft.print("A: "); tft.print(lastEvent);
+
+  // Peer-Events (vom SLAVE)
+  tft.fillRect(0, 84, TFT_W, 16, ST77XX_DARKGREY);
+  tft.setCursor(4, 88); tft.setTextColor(ST77XX_WHITE); tft.print("B: "); tft.print(lastPeer);
+
+  // Fußzeile
+  tft.fillRect(0, TFT_H-16, TFT_W, 16, ST77XX_DARKGREY);
+  tft.setCursor(4, TFT_H-12); tft.setTextColor(ST77XX_WHITE); tft.print("BL: "); tft.print((int)bl_level);
+}
+
+static void publishEvent(const char* btn, const char* type){
+  char payload[64];
+  snprintf(payload, sizeof(payload), "{\"src\":\"A\",\"btn\":\"%s\",\"type\":\"%s\"}", btn, type);
+  mqtt.publish(TOP_EVENT, payload, true);
+  lastEvent = payload;
+  drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
+}
+
+// sehr einfache Parser-Helfer (wir vermeiden JSON-Libs hier bewusst)
+static bool contains(const String& s, const char* pat){ return s.indexOf(pat) >= 0; }
+static String extractValue(const String& s, const char* key){
+  // erwartet ... "key":"VALUE" ...
+  String mark="\""; mark += key; mark += "\":\"";
+  int p = s.indexOf(mark);
+  if(p<0) return "";
+  p += mark.length();
+  int q = s.indexOf("\"", p);
+  if(q<0) return "";
+  return s.substring(p, q);
+}
+
+static void mqttCallback(char* topic, byte* payload, unsigned int len){
+  String t = topic;
+  if(t != TOP_EVENT) return; // nur Events interessieren
+
+  // Payload in String wandeln (klein, <64B)
+  String msg; msg.reserve(len);
+  for(unsigned int i=0;i<len;i++) msg += (char)payload[i];
+
+  // nur auf SLAVE reagieren
+  if(!contains(msg, "\"src\":\"B\"")) return;
+
+  // btn/type grob herausziehen
+  String btn  = extractValue(msg, "btn");   // "L" oder "R"
+  String type = extractValue(msg, "type");  // "short" | "double" | "long"
+  if(btn.length()==0 || type.length()==0) return;
+
+  lastPeer = btn + " " + type;   // z.B. "L double"
+  drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
 }
 
 static void mqttConnect(){
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
   while(!mqtt.connected()){
-    String cid = "esp2slave-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    String cid = "esp2master-" + String((uint32_t)ESP.getEfuseMac(), HEX);
     bool ok = MQTT_USER && *MQTT_USER ?
       mqtt.connect(cid.c_str(), MQTT_USER, MQTT_PASSW, TOP_LWT, 0, true, "0") :
       mqtt.connect(cid.c_str(), TOP_LWT, 0, true, "0");
     if(ok){
       mqtt.publish(TOP_LWT, "1", true);
       mqtt.publish(TOP_TEST, "hallo");
+      mqtt.subscribe(TOP_EVENT);  // <<< jetzt hören wir auf Events (A & B)
       break;
     }
     delay(1000);
   }
 }
 
-static void publishEvent(const char* btn, const char* type){
-  char payload[64];
-  snprintf(payload, sizeof(payload), "{\"src\":\"B\",\"btn\":\"%s\",\"type\":\"%s\"}", btn, type);
-  mqtt.publish(TOP_EVENT, payload, true);
-  lastEvent = payload;
-  drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
-}
-
-// ---------- Button-Helfer ----------
+// ---------- Button-Helfer (Builtin-Typen in Signaturen) ----------
 static void btnInit(int pin, bool &last, bool &state, bool &pressed, bool &pending, uint32_t &tchg, uint32_t &tpress, uint32_t &deadline){
   pinMode(pin, INPUT_PULLUP);
   last = digitalRead(pin);
@@ -216,7 +262,7 @@ void setup(){
   tft.setRotation(1);
   drawStatus("...", "...");
 
-  // Buttons
+  // Buttons initialisieren
   btnInit(BTN_L_PIN, L_last, L_state, L_pressed, L_pending, L_tchg, L_tpress, L_deadline);
   btnInit(BTN_R_PIN, R_last, R_state, R_pressed, R_pending, R_tchg, R_tpress, R_deadline);
 
