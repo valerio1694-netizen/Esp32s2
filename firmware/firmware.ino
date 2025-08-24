@@ -1,13 +1,19 @@
 /*
-  ESP2 MASTER – Layout + bewährtes Web-OTA + permanenter SoftAP-OTA
-  FW: 1.4.3
+  ESP2 MASTER – Layout-Refresh (auf Basis 1.4.0)
+  FW: 1.4.1
 
-  Neu ggü. 1.4.2:
-   - WiFi.mode(WIFI_AP_STA) und SoftAP "ESP2-MASTER-OTA" (IP 192.168.4.1)
-   - OTA-Webseite ist über STA-IP *und* SoftAP-IP erreichbar.
+  Nur Optik geändert:
+   - Header: FW + MQTT-Status
+   - Mitte: großer Titel + kleiner Artist (aus "Artist - Title")
+   - Statusbereich: farbiger STATE + Prozent + Lautstärke-Balken (aus "STATE XX%")
+   - Footer: STA-IP + SoftAP-IP angezeigt
+   - Partielles Redraw (nur geänderte Bereiche)
 
   Unverändert:
-   - Pins, Buttons (Short/Long/Double), MQTT-Topics
+   - OTA: Web (Root) über STA-IP und dauerhaften SoftAP (192.168.4.1)
+   - Buttons: kurz / lang / doppelt -> JSON auf esp2panel/event (src="A")
+   - MQTT Sub: esp2panel/A/line/1  und  esp2panel/A/line/2
+   - Pins & Verkabelung
 */
 
 #include <Arduino.h>
@@ -19,7 +25,7 @@
 #include <Adafruit_ST7735.h>
 
 // ---------- Version ----------
-static const char* FW_VERSION = "1.4.3";   // MASTER
+static const char* FW_VERSION = "1.4.1";
 
 // ---------- Pins ----------
 #define TFT_CS    5
@@ -33,8 +39,6 @@ static const char* FW_VERSION = "1.4.3";   // MASTER
 
 // ---------- Display ----------
 Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
-#define TFT_W 128
-#define TFT_H 160
 
 // Farben
 #define COL_BG    ST77XX_BLACK
@@ -51,7 +55,7 @@ Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 const char* WIFI_SSID = "Peng";
 const char* WIFI_PSK  = "Keineahnung123";
 
-// MQTT (IP direkt)
+// MQTT-Broker per IP (wie bei dir im Netz)
 const char* MQTT_HOST = "192.168.178.65";
 const uint16_t MQTT_PORT = 1883;
 const char* MQTT_USER = "firstclass55555";
@@ -63,7 +67,7 @@ PubSubClient mqtt(wifiClient);
 // ---------- Webserver (OTA) ----------
 WebServer server(80);
 
-// OTA-Upload-Seite
+// Statische OTA-Upload-Seite
 static const char OTA_INDEX[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -73,7 +77,7 @@ static const char OTA_INDEX[] PROGMEM = R"HTML(
 <input type="file" name="update" accept=".bin" required>
 <button type="submit">Upload & Flash</button>
 </form>
-<p>Erreichbar über STA-IP und SoftAP (192.168.4.1). Nach Erfolg Reboot.</p>
+<p>SoftAP: 192.168.4.1 · Nach Erfolg Neustart.</p>
 </body></html>
 )HTML";
 
@@ -106,7 +110,7 @@ String pTitle, pArtist, pState;
 int    pVol = -1;
 bool   mqttOk = false;
 
-// ---------- Vorneweg ----------
+// ---------- Vorwärts ----------
 void drawHeader();
 void drawFooter();
 void drawTitleArtist(bool force=false);
@@ -161,9 +165,7 @@ static BtnEvent pollBtn(Btn& b){
       if (dur <= SHORT_MAX_MS){
         if (b.pendingShort && (t - b.lastShortRel) <= DBL_WIN_MS){
           ev = EV_DOUBLE; b.pendingShort=false; b.lastShortRel=0;
-        } else {
-          b.pendingShort=true; b.lastShortRel=t;
-        }
+        } else { b.pendingShort=true; b.lastShortRel=t; }
       } else if (dur >= LONG_MIN_MS){
         ev = EV_LONG; b.pendingShort=false; b.lastShortRel=0;
       }
@@ -176,9 +178,11 @@ static BtnEvent pollBtn(Btn& b){
 }
 
 // ---------- Layout ----------
+// Header: FW + MQTT
 void drawHeader(){
   tft.fillScreen(COL_BG);
-  clearBox(0,0,TFT_W,20,COL_BG);
+  clearBox(0,0,128,20,COL_BG);
+
   tft.setTextWrap(false);
   tft.setTextSize(1);
   tft.setCursor(2,3);
@@ -190,28 +194,49 @@ void drawHeader(){
   tft.setTextColor(mqttOk ? COL_TXT : COL_ERR);
   tft.print(mqttOk ? " OK" : " ...");
 }
+
+// Footer: STA-IP + AP-IP
 void drawFooter(){
-  clearBox(0,130,TFT_W,30,COL_BG);
+  clearBox(0,130,128,30,COL_BG);
   tft.setTextWrap(false);
   tft.setTextSize(1);
   tft.setTextColor(COL_SUB);
+
   tft.setCursor(2,136);
-  tft.print("ESP2 MASTER  STA: ");
-  tft.print(WiFi.localIP());
+  tft.print("STA: "); tft.print(WiFi.localIP());
+
   tft.setCursor(2,146);
-  tft.print("OTA AP: 192.168.4.1");
+  tft.print("AP : 192.168.4.1");
 }
+
+// Mitte: Titel groß + Artist klein
 void drawTitleArtist(bool force){
   if (!force && gTitle==pTitle && gArtist==pArtist) return;
-  clearBox(0,24,TFT_W,48,COL_BG);
+
+  clearBox(0,24,128,48,COL_BG);
+
+  // Titel groß
   tft.setTextWrap(false);
-  tft.setTextColor(COL_TXT); tft.setTextSize(2); tft.setCursor(2,28); tft.print(gTitle);
-  tft.setTextColor(COL_SUB); tft.setTextSize(1); tft.setCursor(2,56); tft.print(gArtist);
-  pTitle=gTitle; pArtist=gArtist;
+  tft.setTextColor(COL_TXT);
+  tft.setTextSize(2);
+  tft.setCursor(2,28);
+  tft.print(gTitle);
+
+  // Artist klein
+  tft.setTextColor(COL_SUB);
+  tft.setTextSize(1);
+  tft.setCursor(2,56);
+  tft.print(gArtist);
+
+  pTitle = gTitle;
+  pArtist = gArtist;
 }
+
+// Statusbereich: STATE farbig + Prozent + Balken
 void drawStateVolume(bool force){
   if (!force && gState==pState && gVol==pVol) return;
-  clearBox(0,80,TFT_W,40,COL_BG);
+
+  clearBox(0,80,128,40,COL_BG);
 
   uint16_t col = COL_SUB;
   if (gState=="PLAYING") col = COL_PLAY;
@@ -228,16 +253,17 @@ void drawStateVolume(bool force){
   int16_t x,y; uint16_t w,h;
   tft.getTextBounds(vs.c_str(), 0,0, &x,&y,&w,&h);
   tft.setTextColor(COL_TXT);
-  tft.setCursor(TFT_W - w - 4, 84);
+  tft.setCursor(128 - w - 4, 84);
   tft.print(vs);
 
-  int barX=4, barY=104, barW=TFT_W-8, barH=6;
+  int barX=4, barY=104, barW=128-8, barH=6;
   tft.drawRect(barX-1, barY-1, barW+2, barH+2, COL_SUB);
   int fillW = map(gVol, 0, 100, 0, barW);
   tft.fillRect(barX, barY, barW, barH, COL_BOX);
   tft.fillRect(barX, barY, fillW, barH, COL_BAR);
 
-  pState=gState; pVol=gVol;
+  pState = gState;
+  pVol   = gVol;
 }
 
 // ---------- MQTT ----------
@@ -246,33 +272,45 @@ void mqttCallback(char* topic, byte* payload, unsigned int len){
   String msg; msg.reserve(len+1);
   for (unsigned int i=0;i<len;i++) msg += (char)payload[i];
 
+  // A/line/1 -> "Artist - Title"
+  // A/line/2 -> "STATE XX%"
   if (t == "esp2panel/A/line/1"){
     int sep = msg.indexOf(" - ");
-    if (sep >= 0){ gArtist = msg.substring(0, sep); gTitle = msg.substring(sep+3); }
-    else { gArtist = ""; gTitle = msg; }
+    if (sep >= 0){
+      gArtist = msg.substring(0, sep);
+      gTitle  = msg.substring(sep+3);
+    } else {
+      gArtist = "";
+      gTitle  = msg;
+    }
     drawTitleArtist(false);
-  } else if (t == "esp2panel/A/line/2"){
+  }
+  else if (t == "esp2panel/A/line/2"){
     String s = msg; s.trim();
     int sp = s.indexOf(' ');
     if (sp > 0){
       gState = s.substring(0, sp);
-      String rest = s.substring(sp+1); rest.replace("%","");
-      gVol = constrain(rest.toInt(),0,100);
+      String rest = s.substring(sp+1);
+      rest.replace("%","");
+      gVol = constrain(rest.toInt(), 0, 100);
     } else {
       gState = s;
     }
     drawStateVolume(false);
   }
 }
+
 void mqttReconnect(){
   while (!mqtt.connected()){
     String cid = String("esp2panel-A-") + String((uint32_t)ESP.getEfuseMac(), HEX);
     if (mqtt.connect(cid.c_str(), MQTT_USER, MQTT_PASS)){
       mqtt.subscribe("esp2panel/A/line/1");
       mqtt.subscribe("esp2panel/A/line/2");
-      mqttOk = true; drawHeader();
+      mqttOk = true;
+      drawHeader();
     } else {
-      mqttOk = false; drawHeader();
+      mqttOk = false;
+      drawHeader();
       delay(1000);
     }
   }
@@ -283,9 +321,15 @@ void publishEvent(const char* btn, const char* type){
   String payload = String("{\"src\":\"A\",\"btn\":\"") + btn + "\",\"type\":\"" + type + "\"}";
   mqtt.publish("esp2panel/event", payload.c_str());
 
-  clearBox(0,120,TFT_W,12,COL_BG);
-  tft.setTextSize(1); tft.setTextColor(COL_OK); tft.setCursor(2,120);
-  tft.print("Event: A "); tft.print(btn); tft.print(" "); tft.print(type);
+  // Mini-Feedback unten (überschreibt Footer nicht)
+  clearBox(0,120,128,10,COL_BG);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_OK);
+  tft.setCursor(2,120);
+  tft.print("A ");
+  tft.print(btn);
+  tft.print(" ");
+  tft.print(type);
 }
 
 // ---------- Setup / Loop ----------
@@ -293,32 +337,31 @@ void setup(){
   pinMode(BTN_L, INPUT_PULLUP);
   pinMode(BTN_R, INPUT_PULLUP);
 
-  // Backlight (8-bit PWM)
+  // Backlight PWM
   ledcAttachPin(PIN_BL, 0);
   ledcSetup(0, 1000, 8);
   ledcWrite(0, 200);
 
-  // Display Grundlayout
+  // Display
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
   tft.fillScreen(COL_BG);
   drawHeader();
-  drawTitleArtist(true);
-  drawStateVolume(true);
+  drawTitleArtist(true);   // Platzhalter anzeigen
+  drawStateVolume(true);   // Platzhalter anzeigen
 
-  // WLAN: STA + AP parallel
+  // WLAN: STA + SoftAP parallel (SoftAP bleibt für OTA)
   WiFi.mode(WIFI_AP_STA);
-  // SoftAP (ohne Passwort, kann bei Bedarf gesetzt werden)
-  WiFi.softAP("ESP2-MASTER-OTA");
-  // STA verbinden
+  WiFi.softAP("ESP2-MASTER-OTA"); // offen; AP-IP 192.168.4.1
   WiFi.begin(WIFI_SSID, WIFI_PSK);
+
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis()-t0 < 8000) {
+  while (WiFi.status() != WL_CONNECTED && millis()-t0 < 6000){
     delay(150);
   }
-  drawFooter(); // zeigt STA-IP (wenn verbunden) + AP-IP fest (192.168.4.1)
+  drawFooter(); // zeigt STA-IP (falls verbunden) + AP-IP
 
-  // OTA-Routen
+  // OTA Web
   server.on("/", HTTP_GET, handleRootGet);
   server.on("/update", HTTP_POST,
     [](){ server.sendHeader("Connection","close"); server.send(200,"text/plain","OK"); },
