@@ -1,13 +1,12 @@
 /*
-  ESP32-S2 MASTER — MQTT + OTA + 1 Button (FW v1.1.1)
+  ESP32-S2 MASTER — MQTT + OTA + 1 Button (FW v1.1.2)
   - SoftAP (OTA):      SSID ESP2_MASTER / PW flashme123
   - STA (WLAN):        SSID "Peng" / PW "Keineahnung123"
   - MQTT:              192.168.178.65:1883, User "firstclass55555", PW "Zehn+551996"
   - Publish:           esp2panel/online (LWT), esp2panel/test ("hallo" beim Boot),
-                       esp2panel/event  → JSON {"src":"A","btn":"L","type":"short|double|long"}
-  - TFT:               zeigt Status + letztes Event
-  - Button:            GPIO8 gegen GND, interner Pullup, kurz/doppelt/lang, kein Auto-Repeat
+                       esp2panel/event  → {"src":"A","btn":"L","type":"short|double|long"}
   - TFT ST7735 1.8":   CS=5, DC=7, RST=6, SCK=12, MOSI=11; Backlight PWM: GPIO13
+  - Button:            GPIO8 gegen GND, Pullup, kurz/doppelt/lang, kein Auto-Repeat
 */
 
 #include <WiFi.h>
@@ -33,7 +32,7 @@ static const char* AP_SSID = "ESP2_MASTER";
 static const char* AP_PASS = "flashme123";
 
 // ---------- Version ----------
-static const char* FW_VERSION = "1.1.1";
+static const char* FW_VERSION = "1.1.2";
 
 // ---------- TFT / Pins ----------
 static const int TFT_CS=5, TFT_DC=7, TFT_RST=6, TFT_SCK=12, TFT_MOSI=11;
@@ -50,15 +49,23 @@ static const int BL_CH=0, BL_FREQ=5000, BL_RES=8;
 static uint8_t bl_level=200;
 static inline void setBL(uint8_t v){ bl_level=v; ledcWrite(BL_CH,v); }
 
-// ---------- Button (nur einer in diesem Schritt) ----------
+// ---------- Button (GPIO8) ----------
 static const int BTN1_PIN = 8; // gegen GND, interner Pullup
 
-// Eindeutige Namen (nicht mit Standard-Makros kollidieren):
+// Zeitkonstanten (eindeutige Namen)
 static const uint32_t BTN_DEBOUNCE_MS   = 30;
 static const uint32_t BTN_SHORT_MAX_MS  = 300;
 static const uint32_t BTN_LONG_MIN_MS   = 700;
 static const uint32_t BTN_DBL_WIN_MS    = 250;
 
+// ---- Vorwärtsdeklarationen, damit der Arduino-Autoprototyper nichts kaputt macht
+struct Btn;
+enum BtnEvent : uint8_t { EV_NONE, EV_SHORT, EV_DOUBLE, EV_LONG };
+static void     initBtn(Btn& b);
+static bool     btnDebounce(Btn& b);
+static BtnEvent pollBtn(Btn& b);
+
+// ---- Jetzt die vollständige Struktur
 struct Btn {
   int pin; bool pullup;
   bool state; bool last;
@@ -66,45 +73,6 @@ struct Btn {
   bool pressed; uint32_t tpress;
   uint32_t lastShortRel;
 };
-
-enum BtnEvent { EV_NONE, EV_SHORT, EV_DOUBLE, EV_LONG };
-
-Btn btn1{BTN1_PIN,true,false,true,0,false,0,0};
-
-static void initBtn(Btn& b){
-  pinMode(b.pin, b.pullup?INPUT_PULLUP:INPUT);
-  b.last = digitalRead(b.pin);
-  b.state = (b.pullup ? b.last==LOW : b.last==HIGH);
-  b.tchg=millis(); b.pressed=false; b.tpress=0; b.lastShortRel=0;
-}
-
-static bool btnDebounce(Btn& b){
-  bool raw=digitalRead(b.pin);
-  if(raw!=b.last){ b.last=raw; b.tchg=millis(); }
-  if(millis()-b.tchg>=BTN_DEBOUNCE_MS){
-    bool ns = b.pullup ? (raw==LOW) : (raw==HIGH);
-    if(ns!=b.state){ b.state=ns; return true; }
-  }
-  return false;
-}
-
-static BtnEvent pollBtn(Btn& b){
-  BtnEvent ev=EV_NONE; uint32_t now=millis();
-  if(btnDebounce(b)){
-    if(b.state){ b.pressed=true; b.tpress=now; }
-    else{
-      if(b.pressed){
-        uint32_t dt=now-b.tpress;
-        if(dt < BTN_SHORT_MAX_MS){
-          if(b.lastShortRel && (now-b.lastShortRel)<=BTN_DBL_WIN_MS){ ev=EV_DOUBLE; b.lastShortRel=0; }
-          else { ev=EV_SHORT; b.lastShortRel=now; }
-        } else if(dt >= BTN_LONG_MIN_MS){ ev=EV_LONG; }
-      }
-      b.pressed=false;
-    }
-  }
-  return ev;
-}
 
 // ---------- OTA HTTP ----------
 WebServer server(80);
@@ -114,7 +82,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 body{font-family:system-ui;margin:20px} .card{max-width:520px;padding:16px;border:1px solid #ccc;border-radius:12px}
 progress{width:100%;height:16px}
 </style></head><body><div class=card>
-<h2>MASTER OTA (FW v1.1.1)</h2>
+<h2>MASTER OTA (FW v1.1.2)</h2>
 <input id=f type=file accept=".bin,application/octet-stream"><br><br>
 <button id=b>Upload</button><br><br>
 <progress id=p max=100 value=0 hidden></progress>
@@ -158,7 +126,6 @@ static void drawStatus(const String& wifi, const String& mq){
   tft.setCursor(4,42); tft.setTextColor(ST77XX_CYAN); tft.print("WiFi: "); tft.setTextColor(ST77XX_WHITE); tft.print(wifi);
   tft.setCursor(4,54); tft.setTextColor(ST77XX_CYAN); tft.print("MQTT: "); tft.setTextColor(ST77XX_WHITE); tft.print(mq);
   tft.setCursor(4,66); tft.setTextColor(ST77XX_CYAN); tft.print("BL: "); tft.setTextColor(ST77XX_WHITE); tft.print((int)bl_level);
-
   tft.fillRect(0, TFT_H-22, TFT_W, 22, ST77XX_DARKGREY);
   tft.setCursor(4, TFT_H-18); tft.setTextColor(ST77XX_WHITE); tft.print("Event: "); tft.print(lastEvent);
 }
@@ -187,6 +154,43 @@ static void publishEvent(const char* btn, const char* type){
   drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
 }
 
+// ---------- Button-Helfer ----------
+static void initBtn(Btn& b){
+  pinMode(b.pin, INPUT_PULLUP);
+  b.pullup = true;
+  b.last = digitalRead(b.pin);
+  b.state = (b.last==LOW);
+  b.tchg=millis(); b.pressed=false; b.tpress=0; b.lastShortRel=0;
+}
+
+static bool btnDebounce(Btn& b){
+  bool raw=digitalRead(b.pin);
+  if(raw!=b.last){ b.last=raw; b.tchg=millis(); }
+  if(millis()-b.tchg>=BTN_DEBOUNCE_MS){
+    bool ns = (raw==LOW); // Pullup → LOW = gedrückt
+    if(ns!=b.state){ b.state=ns; return true; }
+  }
+  return false;
+}
+
+static BtnEvent pollBtn(Btn& b){
+  BtnEvent ev=EV_NONE; uint32_t now=millis();
+  if(btnDebounce(b)){
+    if(b.state){ b.pressed=true; b.tpress=now; }
+    else{
+      if(b.pressed){
+        uint32_t dt=now-b.tpress;
+        if(dt < BTN_SHORT_MAX_MS){
+          if(b.lastShortRel && (now-b.lastShortRel)<=BTN_DBL_WIN_MS){ ev=EV_DOUBLE; b.lastShortRel=0; }
+          else { ev=EV_SHORT; b.lastShortRel=now; }
+        } else if(dt >= BTN_LONG_MIN_MS){ ev=EV_LONG; }
+      }
+      b.pressed=false;
+    }
+  }
+  return ev;
+}
+
 // ---------- Setup ----------
 void setup(){
   Serial.begin(115200);
@@ -201,7 +205,8 @@ void setup(){
   tft.setRotation(1);
   drawStatus("...", "...");
 
-  // Button
+  // Button init
+  static Btn btn1{BTN1_PIN,true,false,true,0,false,0,0};
   initBtn(btn1);
 
   // Dual Mode: AP (OTA) + STA (MQTT)
@@ -224,6 +229,9 @@ void setup(){
   // MQTT
   if(WiFi.status()==WL_CONNECTED) mqttConnect();
   drawStatus(WiFi.localIP().toString(), mqtt.connected()?"OK":"...");
+
+  // speichere btn1 in RTC/Static für loop
+  // (einfachste Variante: global static oben – hier genügt lokale static Referenz)
 }
 
 // ---------- Loop ----------
@@ -235,6 +243,8 @@ void loop(){
     mqtt.loop();
   }
 
+  // Wir brauchen Zugriff auf btn1 → am einfachsten hier erneut als static referenzieren
+  static Btn btn1{BTN1_PIN,true,false,true,0,false,0,0}; // wird nur beim ersten Eintritt initialisiert
   BtnEvent e1 = pollBtn(btn1);
   if(e1==EV_SHORT)  publishEvent("L","short");
   if(e1==EV_DOUBLE) publishEvent("L","double");
