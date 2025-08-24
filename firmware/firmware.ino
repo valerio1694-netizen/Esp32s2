@@ -1,13 +1,20 @@
 /*
   ESP32-S2 Mini – 1.8" TFT (ST7735) + 2 Buttons + OTA (AP)
-  GPIO13 = TFT-Backlight (PWM dimmbar)
-  Keine separate Status-LED.
+  GPIO13 = TFT-Backlight (PWM dimmbar), KEINE separate Status-LED.
 
   Pins:
-    TFT: CS=5, DC(A0)=7, RST=6, SCK=12, MOSI(SDA)=11
+    TFT: CS=5, DC(A0)=7, RST=6, SCK=12, MOSI(SDA)=11  (MISO unbenutzt)
     BL : 13 (PWM)
     BTN1: 8 (gegen GND, PullUp)
     BTN2: 9 (gegen GND, PullUp)
+
+  Funktionen:
+    - OTA-Weboberfläche (AP "ESP32S2-OTA", PW "flashme123")
+    - Startscreen mit SSID/IP + Live-Buttonstatus
+    - Kurz-/Langdruck-Erkennung
+    - Menü: HOME, INFO, SETTINGS, CALIB (Kalibrierbild)
+    - UI-Bausteine: HintBar, ProgressBar, Key/Value
+    - Backlight per PWM dimmbar; BTN2 kurz toggelt BL
 */
 
 #include <WiFi.h>
@@ -51,8 +58,11 @@ static const int TFT_BL_PIN = 13;
 static const int  BL_PWM_CHANNEL = 0;
 static const int  BL_PWM_FREQ    = 5000;
 static const int  BL_PWM_RES     = 8;
-static uint8_t    bl_level       = 200;
+static uint8_t    bl_level       = 200;  // Starthelligkeit 0..255
 static uint8_t    bl_prev_level  = 200;
+
+static void setBacklight(uint8_t lvl) { bl_level = lvl; ledcWrite(BL_PWM_CHANNEL, lvl); }
+static void toggleBacklight()         { if (bl_level>0){ bl_prev_level=bl_level; setBacklight(0);} else setBacklight(bl_prev_level?bl_prev_level:200); }
 
 // =================== Display ===================
 #define CALIB_TAB INITR_BLACKTAB
@@ -71,19 +81,6 @@ static const uint32_t LONG_MS_MIN   = 700;
 static Btn btn1{BTN1_PIN, true, false, true, 0, false, 0};
 static Btn btn2{BTN2_PIN, true, false, true, 0, false, 0};
 
-// =================== Seiten/Status ===================
-enum Page { PAGE_HOME=0, PAGE_INFO, PAGE_SETTINGS, PAGE_CALIB, PAGE_COUNT };
-static Page currentPage = PAGE_HOME;
-static String apIP = "0.0.0.0";
-
-// =================== Forward-Declarations ===================
-static void goPage(Page p);
-static void renderHome(bool full=true);
-static void renderInfo(bool full=true);
-static void renderSettings(bool full=true);
-static void renderCalib(bool full=true);
-
-// =================== Button-Funktionen ===================
 static void initButton(Btn& b) {
   pinMode(b.pin, b.pullup ? INPUT_PULLUP : INPUT);
   b.lastRead = digitalRead(b.pin);
@@ -94,16 +91,10 @@ static void initButton(Btn& b) {
 }
 static bool debouncedUpdate(Btn& b) {
   bool raw = digitalRead(b.pin);
-  if (raw != b.lastRead) {
-    b.lastChange = millis();
-    b.lastRead = raw;
-  }
+  if (raw != b.lastRead) { b.lastChange = millis(); b.lastRead = raw; }
   if ((millis() - b.lastChange) >= DEBOUNCE_MS) {
     bool newState = b.pullup ? (raw == LOW) : (raw == HIGH);
-    if (newState != b.state) {
-      b.state = newState;
-      return true;
-    }
+    if (newState != b.state) { b.state = newState; return true; }
   }
   return false;
 }
@@ -111,63 +102,107 @@ static BtnEvent pollBtnEvent(Btn& b) {
   BtnEvent ev = EV_NONE;
   if (debouncedUpdate(b)) {
     if (b.state) { b.pressedEdge = true; b.pressTs = millis(); }
-    else {
-      if (b.pressedEdge) {
-        uint32_t dt = millis() - b.pressTs;
-        if (dt < SHORT_MS_MAX) ev = EV_SHORT;
-        else if (dt >= LONG_MS_MIN) ev = EV_LONG;
-      }
-      b.pressedEdge = false;
-    }
+    else { if (b.pressedEdge) { uint32_t dt = millis() - b.pressTs;
+           if (dt < SHORT_MS_MAX) ev = EV_SHORT; else if (dt >= LONG_MS_MIN) ev = EV_LONG; }
+           b.pressedEdge = false; }
   } else if (b.state && b.pressedEdge) {
-    uint32_t dt = millis() - b.pressTs;
-    if (dt >= LONG_MS_MIN) { ev = EV_LONG; b.pressedEdge = false; }
+    if (millis() - b.pressTs >= LONG_MS_MIN) { ev = EV_LONG; b.pressedEdge = false; }
   }
   return ev;
 }
 
-// =================== Backlight ===================
-static void setBacklight(uint8_t lvl) {
-  bl_level = lvl;
-  ledcWrite(BL_PWM_CHANNEL, lvl);
-}
-static void toggleBacklight() {
-  if (bl_level > 0) { bl_prev_level = bl_level; setBacklight(0); }
-  else setBacklight(bl_prev_level ? bl_prev_level : 200);
-}
+// =================== Seiten/Status ===================
+enum Page { PAGE_HOME=0, PAGE_INFO, PAGE_SETTINGS, PAGE_CALIB, PAGE_COUNT };
+static Page currentPage = PAGE_HOME;
+static String apIP = "0.0.0.0";
 
 // =================== UI-Bausteine ===================
 static void drawHintBar(const char* text) {
   tft.fillRect(0, TFT_H-14, TFT_W, 14, ST77XX_DARKGREY);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(1);
-  tft.setCursor(2, TFT_H-12);
-  tft.print(text);
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
+  tft.setCursor(2, TFT_H-12); tft.print(text);
 }
-static void showMessage(const char* text, uint16_t color = ST77XX_WHITE, uint16_t bg = ST77XX_BLACK) {
-  tft.fillScreen(bg);
-  tft.setTextSize(2);
-  tft.setTextColor(color);
-  tft.setCursor(6, 8);
-  tft.print(text);
+static void showMessage(const char* text, uint16_t color=ST77XX_WHITE, uint16_t bg=ST77XX_BLACK) {
+  tft.fillScreen(bg); tft.setTextSize(2); tft.setTextColor(color);
+  tft.setCursor(6,8); tft.print(text);
 }
-static void printKV(int16_t x, int16_t y, const char* k, const String& v, uint16_t kc=ST77XX_YELLOW, uint16_t vc=ST77XX_WHITE) {
-  tft.setTextSize(1);
-  tft.setCursor(x, y);
-  tft.setTextColor(kc); tft.print(k);
-  tft.setTextColor(vc); tft.print(v);
+static void printKV(int16_t x,int16_t y,const char* k,const String& v,uint16_t kc=ST77XX_YELLOW,uint16_t vc=ST77XX_WHITE){
+  tft.setTextSize(1); tft.setCursor(x,y); tft.setTextColor(kc); tft.print(k); tft.setTextColor(vc); tft.print(v);
 }
-static void drawProgressBar(int16_t x, int16_t y, int16_t w, int16_t h, int percent) {
-  if (percent < 0) percent = 0; if (percent > 100) percent = 100;
-  tft.drawRect(x, y, w, h, ST77XX_WHITE);
-  int fillw = (w-2) * percent / 100;
-  tft.fillRect(x+1, y+1, fillw, h-2, ST77XX_GREEN);
+static void drawProgressBar(int16_t x,int16_t y,int16_t w,int16_t h,int percent){
+  if(percent<0)percent=0; if(percent>100)percent=100;
+  tft.drawRect(x,y,w,h,ST77XX_WHITE);
+  int fillw=(w-2)*percent/100; tft.fillRect(x+1,y+1,fillw,h-2,ST77XX_GREEN);
 }
 
-// =================== Seitenwechsel ===================
-static void goPage(Page p) {
+// =================== Seiten-Render ===================
+static void renderHome(bool full){
+  if(full){
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2);
+    tft.setCursor(6,6); tft.print("HOME");
+
+    tft.setTextSize(1);
+    printKV(6,30,"SSID: ", String(AP_SSID));
+    printKV(6,42,"IP  : ", apIP);
+    printKV(6,58,"BTN1: ", btn1.state ? "GEDRUECKT" : "LOS");
+    printKV(6,70,"BTN2: ", btn2.state ? "GEDRUECKT" : "LOS");
+
+    drawHintBar("BTN1: weiter  BTN2: BL toggeln | BTN2 lang: HOME");
+  } else {
+    tft.fillRect(40,58,TFT_W-46,10,ST77XX_BLACK);
+    tft.setCursor(40,58); tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
+    tft.print(btn1.state ? "GEDRUECKT" : "LOS");
+
+    tft.fillRect(40,70,TFT_W-46,10,ST77XX_BLACK);
+    tft.setCursor(40,70);
+    tft.print(btn2.state ? "GEDRUECKT" : "LOS");
+  }
+}
+static void renderInfo(bool /*full*/){
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_CYAN); tft.setTextSize(2);
+  tft.setCursor(6,6); tft.print("INFO");
+
+  tft.setTextSize(1);
+  printKV(6,30,"SSID: ", String(AP_SSID));
+  printKV(6,42,"IP  : ", apIP);
+  int pct = (int)((bl_level*100)/255);
+  printKV(6,54,"BL  : ", String(pct)+"%");
+
+  drawHintBar("BTN1: weiter  BTN2: BL toggeln  BTN2 lang: HOME");
+}
+static void renderSettings(bool /*full*/){
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(2);
+  tft.setCursor(6,6); tft.print("SETTINGS");
+
+  tft.setTextSize(1); tft.setCursor(6,32); tft.setTextColor(ST77XX_WHITE);
+  tft.print("OK: Kalibrierungsseite\nBTN1 lang: Progress-Demo");
+
+  drawHintBar("BTN1: weiter  BTN2: OK  BTN2 lang: HOME");
+}
+static void renderCalib(bool /*full*/){
+  tft.fillScreen(ST77XX_BLACK);
+  tft.drawRect(0,0,TFT_W,TFT_H,ST77XX_WHITE);
+  tft.drawRect(1,1,TFT_W-2,TFT_H-2,ST77XX_RED);
+  tft.drawRect(2,2,TFT_W-4,TFT_H-4,ST77XX_GREEN);
+
+  tft.fillRect(0,0,5,5,ST77XX_WHITE);
+  tft.fillRect(TFT_W-5,0,5,5,ST77XX_WHITE);
+  tft.fillRect(0,TFT_H-5,5,5,ST77XX_WHITE);
+  tft.fillRect(TFT_W-5,TFT_H-5,5,5,ST77XX_WHITE);
+
+  tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(6,10); tft.print("CALIB: Pruefe, ob alles sichtbar ist.");
+  tft.setCursor(6,24); tft.print("TAB: BLACKTAB");
+
+  drawHintBar("BTN1: weiter  BTN2: OK  BTN2 lang: HOME");
+}
+
+static void goPage(Page p){
   currentPage = p;
-  switch (p) {
+  switch(p){
     case PAGE_HOME:     renderHome(true); break;
     case PAGE_INFO:     renderInfo(true); break;
     case PAGE_SETTINGS: renderSettings(true); break;
@@ -187,7 +222,7 @@ body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:20px}
 progress{width:100%;height:16px}.ok{color:green}.err{color:#b00}
 </style></head><body>
 <div class="card">
-<h2>ESP32-S2 OTA Firmware Upload</h2>
+<h2>ESP32‑S2 OTA Firmware Upload</h2>
 <input id="file" type="file" accept=".bin,application/octet-stream"><br><br>
 <button id="btn">Upload starten</button><br><br>
 <progress id="pb" max="100" value="0" hidden></progress>
@@ -205,21 +240,21 @@ b.onclick=()=>{
 </script></body></html>
 )HTML";
 
-static bool isAuthenticated() {
+static bool isAuthenticated(){
   if (!HTTP_USER || !*HTTP_USER) return true;
   if (server.authenticate(HTTP_USER, HTTP_PASS)) return true;
   server.requestAuthentication();
   return false;
 }
-static void handleRoot() {
+static void handleRoot(){
   if (!isAuthenticated()) return;
   server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
 }
-static void handleNotFound() {
+static void handleNotFound(){
   if (!isAuthenticated()) return;
   server.send(404, "text/plain", "Not Found");
 }
-static void handleUpdateUpload() {
+static void handleUpdateUpload(){
   if (!isAuthenticated()) return;
   HTTPUpload& upload = server.upload();
   static bool beginOk = false;
@@ -229,103 +264,32 @@ static void handleUpdateUpload() {
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (beginOk) Update.write(upload.buf, upload.currentSize);
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (beginOk && Update.end(true)) {
-      server.send(200, "text/plain", "OK");
-      delay(200); ESP.restart();
-    } else {
-      server.send(500, "text/plain", "Update failed");
-    }
+    if (beginOk && Update.end(true)) { server.send(200,"text/plain","OK"); delay(200); ESP.restart(); }
+    else { server.send(500,"text/plain","Update failed"); }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    Update.abort();
-    server.send(500, "text/plain", "Upload abgebrochen");
+    Update.abort(); server.send(500,"text/plain","Upload abgebrochen");
   }
 }
 
-// =================== Renderfunktionen ===================
-static void renderHome(bool full) {
-  if (full) {
-    tft.fillScreen(ST77XX_BLACK);
-    tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2);
-    tft.setCursor(6, 6); tft.print("HOME");
-
-    tft.setTextSize(1);
-    printKV(6, 30, "SSID: ", String(AP_SSID));
-    printKV(6, 42, "IP  : ", apIP);
-    printKV(6, 58, "BTN1: ", btn1.state ? "GEDRUECKT" : "LOS");
-    printKV(6, 70, "BTN2: ", btn2.state ? "GEDRUECKT" : "LOS");
-
-    drawHintBar("BTN1: weiter  BTN2: BL toggeln | BTN2 lang: HOME");
-  } else {
-    tft.fillRect(40, 58, TFT_W-46, 10, ST77XX_BLACK);
-    tft.setCursor(40, 58); tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
-    tft.print(btn1.state ? "GEDRUECKT" : "LOS");
-
-    tft.fillRect(40, 70, TFT_W-46, 10, ST77XX_BLACK);
-    tft.setCursor(40, 70);
-    tft.print(btn2.state ? "GEDRUECKT" : "LOS");
-  }
-}
-static void renderInfo(bool full) {
-  (void)full;
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextColor(ST77XX_CYAN); tft.setTextSize(2);
-  tft.setCursor(6, 6); tft.print("INFO");
-
-  tft.setTextSize(1);
-  printKV(6, 30, "SSID: ", String(AP_SSID));
-  printKV(6, 42, "IP  : ", apIP);
-  int pct = (int)((bl_level * 100) / 255);
-  printKV(6, 54, "BL  : ", String(pct) + "%");
-
-  drawHintBar("BTN1: weiter  BTN2: BL toggeln  BTN2 lang: HOME");
-}
-static void renderSettings(bool full) {
-  (void)full;
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(2);
-  tft.setCursor(6, 6); tft.print("SETTINGS");
-
-  tft.setTextSize(1);
-  tft.setCursor(6, 32); tft.setTextColor(ST77XX_WHITE);
-  tft.print("OK: Kalibrierungsseite\nBTN1 lang: Progress-Demo");
-
-  drawHintBar("BTN1: weiter  BTN2: OK  BTN2 lang: HOME");
-}
-static void renderCalib(bool full) {
-  (void)full;
-  tft.fillScreen(ST77XX_BLACK);
-  tft.drawRect(0, 0, TFT_W, TFT_H, ST77XX_WHITE);
-  tft.drawRect(1, 1, TFT_W-2, TFT_H-2, ST77XX_RED);
-  tft.drawRect(2, 2, TFT_W-4, TFT_H-4, ST77XX_GREEN);
-
-  tft.fillRect(0,0,5,5,ST77XX_WHITE);
-  tft.fillRect(TFT_W-5,0,5,5,ST77XX_WHITE);
-  tft.fillRect(0,TFT_H-5,5,5,ST77XX_WHITE);
-  tft.fillRect(TFT_W-5,TFT_H-5,5,5,ST77XX_WHITE);
-
-  tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(6, 10); tft.print("CALIB: Pruefe, ob alles sichtbar ist.");
-  tft.setCursor(6, 24); tft.print("TAB: BLACKTAB");
-
-  drawHintBar("BTN1: weiter  BTN2: OK  BTN2 lang: HOME");
-}
-
-// =================== Setup ===================
+// =================== Setup / Loop ===================
 void setup() {
   Serial.begin(115200); delay(150);
 
+  // Backlight PWM
   ledcSetup(BL_PWM_CHANNEL, BL_PWM_FREQ, BL_PWM_RES);
   ledcAttachPin(TFT_BL_PIN, BL_PWM_CHANNEL);
   setBacklight(bl_level);
 
-  initButton(btn1);
-  initButton(btn2);
+  // Buttons
+  initButton(btn1); initButton(btn2);
 
+  // Display
   tft.initR(CALIB_TAB);
   tft.setRotation(1);
   tft.fillScreen(ST77XX_BLACK);
   showMessage("Boot...", ST77XX_WHITE, ST77XX_BLACK);
 
+  // WiFi AP + OTA
   WiFi.mode(WIFI_MODE_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   apIP = WiFi.softAPIP().toString();
@@ -338,12 +302,13 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
 
+  // Startseite
   goPage(PAGE_HOME);
 }
 
-// =================== Loop ===================
 void loop() {
   server.handleClient();
+
   BtnEvent e1 = pollBtnEvent(btn1);
   BtnEvent e2 = pollBtnEvent(btn2);
 
@@ -354,8 +319,8 @@ void loop() {
     if (e1 == EV_LONG) {
       tft.fillScreen(ST77XX_BLACK);
       tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
-      tft.setCursor(6, 6); tft.print("Progress-Demo");
-      for (int p = 0; p <= 100; p+=5) { drawProgressBar(10, 30, TFT_W-20, 14, p); delay(50); }
+      tft.setCursor(6,6); tft.print("Progress-Demo");
+      for (int p=0; p<=100; p+=5) { drawProgressBar(10,30,TFT_W-20,14,p); delay(50); }
       delay(300); renderHome(true);
     }
     if (e2 == EV_LONG) { goPage(PAGE_HOME); }
@@ -370,12 +335,16 @@ void loop() {
     if (e1 == EV_LONG) {
       tft.fillScreen(ST77XX_BLACK);
       tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
-      tft.setCursor(6, 6); tft.print("Progress-Demo");
-      for (int p = 0; p <= 100; p+=5) { drawProgressBar(10, 30, TFT_W-20, 14, p); delay(50); }
+      tft.setCursor(6,6); tft.print("Progress-Demo");
+      for (int p=0; p<=100; p+=5) { drawProgressBar(10,30,TFT_W-20,14,p); delay(50); }
       delay(300); renderSettings(true);
     }
     if (e2 == EV_SHORT) { goPage(PAGE_CALIB); }
     if (e2 == EV_LONG)  { goPage(PAGE_HOME); }
   }
   else if (currentPage == PAGE_CALIB) {
-    if (e1 == EV_SHORT || e2 == EV_SHORT || e2 == EV_LONG)
+    if (e1 == EV_SHORT || e2 == EV_SHORT || e2 == EV_LONG) {
+      goPage(PAGE_HOME);
+    }
+  }
+}
