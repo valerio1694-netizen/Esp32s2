@@ -24,6 +24,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 
+// ---------- Forward-Decl. für Arduino-Autoprototyping ----------
+enum Page : uint8_t;  // vollständige Definition weiter unten
+
 // =================== Typen ===================
 struct Btn {
   int pin;
@@ -54,15 +57,14 @@ static const int BTN1_PIN = 8;
 static const int BTN2_PIN = 9;
 
 // ===== Backlight (PWM auf GPIO 13) =====
-static const int TFT_BL_PIN = 13;
-static const int  BL_PWM_CHANNEL = 0;
-static const int  BL_PWM_FREQ    = 5000;
-static const int  BL_PWM_RES     = 8;
-static uint8_t    bl_level       = 200;  // Starthelligkeit 0..255
-static uint8_t    bl_prev_level  = 200;
-
-static void setBacklight(uint8_t lvl) { bl_level = lvl; ledcWrite(BL_PWM_CHANNEL, lvl); }
-static void toggleBacklight()         { if (bl_level>0){ bl_prev_level=bl_level; setBacklight(0);} else setBacklight(bl_prev_level?bl_prev_level:200); }
+static const int TFT_BL_PIN   = 13;
+static const int BL_PWM_CHANNEL = 0;
+static const int BL_PWM_FREQ    = 5000;
+static const int BL_PWM_RES     = 8;
+static uint8_t   bl_level       = 200; // Starthelligkeit 0..255
+static uint8_t   bl_prev_level  = 200;
+static inline void setBacklight(uint8_t lvl) { bl_level = lvl; ledcWrite(BL_PWM_CHANNEL, lvl); }
+static inline void toggleBacklight()         { if (bl_level>0){ bl_prev_level=bl_level; setBacklight(0);} else setBacklight(bl_prev_level?bl_prev_level:200); }
 
 // =================== Display ===================
 #define CALIB_TAB INITR_BLACKTAB
@@ -81,6 +83,32 @@ static const uint32_t LONG_MS_MIN   = 700;
 static Btn btn1{BTN1_PIN, true, false, true, 0, false, 0};
 static Btn btn2{BTN2_PIN, true, false, true, 0, false, 0};
 
+// =================== Seiten/Status ===================
+static String apIP = "0.0.0.0";
+
+// ---------- Funktions-Prototypen (nutzen ggf. Page) ----------
+static void initButton(Btn& b);
+static bool debouncedUpdate(Btn& b);
+static BtnEvent pollBtnEvent(Btn& b);
+
+static void drawHintBar(const char* text);
+static void showMessage(const char* text, uint16_t color=ST77XX_WHITE, uint16_t bg=ST77XX_BLACK);
+static void printKV(int16_t x, int16_t y, const char* k, const String& v, uint16_t kc=ST77XX_YELLOW, uint16_t vc=ST77XX_WHITE);
+static void drawProgressBar(int16_t x,int16_t y,int16_t w,int16_t h,int percent);
+
+static void renderHome(bool full=true);
+static void renderInfo(bool full=true);
+static void renderSettings(bool full=true);
+static void renderCalib(bool full=true);
+
+static void goPage(Page p);
+
+static bool isAuthenticated();
+static void handleRoot();
+static void handleNotFound();
+static void handleUpdateUpload();
+
+// =================== Button-Funktionen ===================
 static void initButton(Btn& b) {
   pinMode(b.pin, b.pullup ? INPUT_PULLUP : INPUT);
   b.lastRead = digitalRead(b.pin);
@@ -103,7 +131,8 @@ static BtnEvent pollBtnEvent(Btn& b) {
   if (debouncedUpdate(b)) {
     if (b.state) { b.pressedEdge = true; b.pressTs = millis(); }
     else { if (b.pressedEdge) { uint32_t dt = millis() - b.pressTs;
-           if (dt < SHORT_MS_MAX) ev = EV_SHORT; else if (dt >= LONG_MS_MIN) ev = EV_LONG; }
+           if (dt < SHORT_MS_MAX) ev = EV_SHORT;
+           else if (dt >= LONG_MS_MIN) ev = EV_LONG; }
            b.pressedEdge = false; }
   } else if (b.state && b.pressedEdge) {
     if (millis() - b.pressTs >= LONG_MS_MIN) { ev = EV_LONG; b.pressedEdge = false; }
@@ -111,22 +140,17 @@ static BtnEvent pollBtnEvent(Btn& b) {
   return ev;
 }
 
-// =================== Seiten/Status ===================
-enum Page { PAGE_HOME=0, PAGE_INFO, PAGE_SETTINGS, PAGE_CALIB, PAGE_COUNT };
-static Page currentPage = PAGE_HOME;
-static String apIP = "0.0.0.0";
-
 // =================== UI-Bausteine ===================
 static void drawHintBar(const char* text) {
   tft.fillRect(0, TFT_H-14, TFT_W, 14, ST77XX_DARKGREY);
   tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
   tft.setCursor(2, TFT_H-12); tft.print(text);
 }
-static void showMessage(const char* text, uint16_t color=ST77XX_WHITE, uint16_t bg=ST77XX_BLACK) {
+static void showMessage(const char* text, uint16_t color, uint16_t bg) {
   tft.fillScreen(bg); tft.setTextSize(2); tft.setTextColor(color);
   tft.setCursor(6,8); tft.print(text);
 }
-static void printKV(int16_t x,int16_t y,const char* k,const String& v,uint16_t kc=ST77XX_YELLOW,uint16_t vc=ST77XX_WHITE){
+static void printKV(int16_t x,int16_t y,const char* k,const String& v,uint16_t kc,uint16_t vc){
   tft.setTextSize(1); tft.setCursor(x,y); tft.setTextColor(kc); tft.print(k); tft.setTextColor(vc); tft.print(v);
 }
 static void drawProgressBar(int16_t x,int16_t y,int16_t w,int16_t h,int percent){
@@ -135,7 +159,71 @@ static void drawProgressBar(int16_t x,int16_t y,int16_t w,int16_t h,int percent)
   int fillw=(w-2)*percent/100; tft.fillRect(x+1,y+1,fillw,h-2,ST77XX_GREEN);
 }
 
-// =================== Seiten-Render ===================
+// =================== OTA Website ===================
+static const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html><html lang="de"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-S2 OTA Upload</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:20px}
+.card{max-width:520px;padding:16px;border:1px solid #ccc;border-radius:12px}
+progress{width:100%;height:16px}.ok{color:green}.err{color:#b00}
+</style></head><body>
+<div class="card">
+<h2>ESP32‑S2 OTA Firmware Upload</h2>
+<input id="file" type="file" accept=".bin,application/octet-stream"><br><br>
+<button id="btn">Upload starten</button><br><br>
+<progress id="pb" max="100" value="0" hidden></progress>
+<div id="msg"></div>
+</div>
+<script>
+const b=document.getElementById("btn"),f=document.getElementById("file"),pb=document.getElementById("pb"),m=document.getElementById("msg");
+b.onclick=()=>{
+ if(!f.files.length){m.textContent="Bitte .bin auswählen";m.className="err";return;}
+ const x=new XMLHttpRequest();pb.hidden=false;pb.value=0;m.textContent="Lade hoch...";
+ x.upload.onprogress=e=>{if(e.lengthComputable)pb.value=Math.round(e.loaded/e.total*100);};
+ x.onload=()=>{if(x.status==200){m.textContent="OK – Reboot...";m.className="ok";pb.value=100;setTimeout(()=>location.reload(),6000);}else{m.textContent="Fehler: "+x.responseText;m.className="err";}};
+ const form=new FormData();form.append("firmware",f.files[0]);x.open("POST","/update",true);x.send(form);
+};
+</script></body></html>
+)HTML";
+
+static bool isAuthenticated(){
+  if (!HTTP_USER || !*HTTP_USER) return true;
+  if (server.authenticate(HTTP_USER, HTTP_PASS)) return true;
+  server.requestAuthentication();
+  return false;
+}
+static void handleRoot(){
+  if (!isAuthenticated()) return;
+  server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+}
+static void handleNotFound(){
+  if (!isAuthenticated()) return;
+  server.send(404, "text/plain", "Not Found");
+}
+static void handleUpdateUpload(){
+  if (!isAuthenticated()) return;
+  HTTPUpload& upload = server.upload();
+  static bool beginOk = false;
+
+  if (upload.status == UPLOAD_FILE_START) {
+    beginOk = Update.begin(UPDATE_SIZE_UNKNOWN);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (beginOk) Update.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (beginOk && Update.end(true)) { server.send(200,"text/plain","OK"); delay(200); ESP.restart(); }
+    else { server.send(500,"text/plain","Update failed"); }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort(); server.send(500,"text/plain","Upload abgebrochen");
+  }
+}
+
+// =================== Jetzt: enum Page-Definition & State ===================
+enum Page : uint8_t { PAGE_HOME=0, PAGE_INFO, PAGE_SETTINGS, PAGE_CALIB, PAGE_COUNT };
+static Page currentPage = PAGE_HOME;
+
+// =================== Render & Seitenwechsel ===================
 static void renderHome(bool full){
   if(full){
     tft.fillScreen(ST77XX_BLACK);
@@ -199,7 +287,6 @@ static void renderCalib(bool /*full*/){
 
   drawHintBar("BTN1: weiter  BTN2: OK  BTN2 lang: HOME");
 }
-
 static void goPage(Page p){
   currentPage = p;
   switch(p){
@@ -208,66 +295,6 @@ static void goPage(Page p){
     case PAGE_SETTINGS: renderSettings(true); break;
     case PAGE_CALIB:    renderCalib(true); break;
     default: break;
-  }
-}
-
-// =================== OTA Website ===================
-static const char INDEX_HTML[] PROGMEM = R"HTML(
-<!doctype html><html lang="de"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-S2 OTA Upload</title>
-<style>
-body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:20px}
-.card{max-width:520px;padding:16px;border:1px solid #ccc;border-radius:12px}
-progress{width:100%;height:16px}.ok{color:green}.err{color:#b00}
-</style></head><body>
-<div class="card">
-<h2>ESP32‑S2 OTA Firmware Upload</h2>
-<input id="file" type="file" accept=".bin,application/octet-stream"><br><br>
-<button id="btn">Upload starten</button><br><br>
-<progress id="pb" max="100" value="0" hidden></progress>
-<div id="msg"></div>
-</div>
-<script>
-const b=document.getElementById("btn"),f=document.getElementById("file"),pb=document.getElementById("pb"),m=document.getElementById("msg");
-b.onclick=()=>{
- if(!f.files.length){m.textContent="Bitte .bin auswählen";m.className="err";return;}
- const x=new XMLHttpRequest();pb.hidden=false;pb.value=0;m.textContent="Lade hoch...";
- x.upload.onprogress=e=>{if(e.lengthComputable)pb.value=Math.round(e.loaded/e.total*100);};
- x.onload=()=>{if(x.status==200){m.textContent="OK – Reboot...";m.className="ok";pb.value=100;setTimeout(()=>location.reload(),6000);}else{m.textContent="Fehler: "+x.responseText;m.className="err";}};
- const form=new FormData();form.append("firmware",f.files[0]);x.open("POST","/update",true);x.send(form);
-};
-</script></body></html>
-)HTML";
-
-static bool isAuthenticated(){
-  if (!HTTP_USER || !*HTTP_USER) return true;
-  if (server.authenticate(HTTP_USER, HTTP_PASS)) return true;
-  server.requestAuthentication();
-  return false;
-}
-static void handleRoot(){
-  if (!isAuthenticated()) return;
-  server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
-}
-static void handleNotFound(){
-  if (!isAuthenticated()) return;
-  server.send(404, "text/plain", "Not Found");
-}
-static void handleUpdateUpload(){
-  if (!isAuthenticated()) return;
-  HTTPUpload& upload = server.upload();
-  static bool beginOk = false;
-
-  if (upload.status == UPLOAD_FILE_START) {
-    beginOk = Update.begin(UPDATE_SIZE_UNKNOWN);
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (beginOk) Update.write(upload.buf, upload.currentSize);
-  } else if (upload.status == UPLOAD_FILE_END) {
-    if (beginOk && Update.end(true)) { server.send(200,"text/plain","OK"); delay(200); ESP.restart(); }
-    else { server.send(500,"text/plain","Update failed"); }
-  } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    Update.abort(); server.send(500,"text/plain","Upload abgebrochen");
   }
 }
 
