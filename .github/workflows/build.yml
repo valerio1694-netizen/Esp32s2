@@ -16,8 +16,8 @@ jobs:
     env:
       CLI_VERSION: "0.35.3"
       ESP32_CORE: "esp32:esp32@2.0.17"
-      # Wemos D1 mini ESP32
-      FQBN: "esp32:esp32:d1_mini32"
+      # AZ-Delivery ESP32 WROOM DevKit -> "ESP32 Dev Module"
+      FQBN: "esp32:esp32:esp32"
 
     steps:
       - name: Checkout repository
@@ -41,12 +41,13 @@ jobs:
           arduino-cli core install "${ESP32_CORE}"
           arduino-cli core list
 
-      # Nur drin lassen, was du wirklich brauchst – Beispiel:
       - name: Install libraries
         run: |
           set -euxo pipefail
-          arduino-cli lib install "WiFi"
+          # WiFi ist im ESP32-Core schon enthalten, muss nicht installiert werden
           arduino-cli lib install "PubSubClient"
+          # Für SK120/Modbus (falls im Sketch verwendet)
+          arduino-cli lib install "ModbusMaster"
 
       - name: Compile firmware
         run: |
@@ -60,7 +61,7 @@ jobs:
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-d1mini32-firmware
+          name: esp32-devmodule-firmware
           path: |
             build/*.bin
             build/*.elf
