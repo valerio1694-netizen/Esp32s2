@@ -1,316 +1,183 @@
-/*
- * ESP32 18650-Tester (AP-Modus)
- * - Low-Side-Shunt 0,02 Ω
- * - VBatt über Teiler (98,1k / 33k) an ADC34
- * - Shunt oben (GND-Knoten) an ADC35
- * - MOSFET-Gate an GPIO25 über 220 Ω
- * - Webinterface:
- *      - Live-Leerlaufspannung (1 Hz)
- *      - IR-Messung (Mehrfachmessung, Mittelwert)
- *      - Web-OTA (.bin Upload)
- */
-
 #include <WiFi.h>
 #include <WebServer.h>
-#include <Update.h>
+#include <ModbusMaster.h>
 
-// ======== AP-KONFIG =========
-const char* AP_SSID     = "18650-Tester";
-const char* AP_PASSWORD = "12345678";   // nach Wunsch ändern
+// ---------- SK120 / Modbus ----------
+HardwareSerial SKSerial(2);      // UART2
+ModbusMaster sk120;
 
-// ======== PINS ========
-const int PIN_BAT_ADC    = 34;  // VBatt-Teiler
-const int PIN_SHUNT_ADC  = 35;  // Shunt oben (GND-Knoten)
-const int PIN_LOAD_FET   = 25;  // MOSFET-Gate
+// Pins zum SK120
+constexpr int SK120_RX_PIN = 16; // ESP empfängt hier (an SK120-TX)
+constexpr int SK120_TX_PIN = 17; // ESP sendet hier (an SK120-RX)
 
-// ======== WIDERSTÄNDE ========
-const float R_DIV_TOP    = 98100.0f;   // 98,1k
-const float R_DIV_BOTTOM = 33000.0f;   // 33k
-const float R_SHUNT      = 0.020f;     // 0,02 Ω
+// Letzte gelesene Werte
+float u_set = 0.0f;
+float i_set = 0.0f;
+float u_meas = 0.0f;
+float i_meas = 0.0f;
+float p_meas = 0.0f;
+bool  out_on = false;
 
-// ======== ADC ========
-const float ADC_REF_V    = 1.10f;
-const int   ADC_MAX      = 4095;
-
-// ======== KALIBRIERUNG ========
-// Spannung war im Web zu hoch (4,37 V statt 4,07 V):
-// Faktor = 4,07 / 4,37 ≈ 0,93
-float CAL_VOLTAGE_FACTOR = 0.93f;
-float CAL_CURRENT_FACTOR = 1.0f;   // Strom noch unkalibriert
-
-// ======== IR-MESSUNG ========
-const int   IR_SAMPLES        = 5;
-const int   IR_DELAY_OPEN_MS  = 200;
-const int   IR_DELAY_LOAD_MS  = 200;
-const float IR_MIN_CURRENT_A  = 0.05f;
-
-// ======== GLOBALE WERTE ========
-float g_v_idle   = 0.0f;
-float g_v_open   = 0.0f;
-float g_v_load   = 0.0f;
-float g_i_load   = 0.0f;
-float g_r_int    = 0.0f;
-bool  g_validIR  = false;
-bool  g_isMeasuring = false;
+// ---------- WiFi / Web ----------
+const char* AP_SSID     = "LabPSU";
+const char* AP_PASSWORD = "12345678";
 
 WebServer server(80);
 
+// ---------- Hilfsfunktionen SK120 ----------
 
-// ==========================================
-//                ADC-FUNKTIONEN
-// ==========================================
-int readAdcAveraged(int pin, int samples = 16) {
-  long sum = 0;
-  for (int i = 0; i < samples; i++) {
-    sum += analogRead(pin);
-    delayMicroseconds(200);
-  }
-  return (int)(sum / samples);
+// Sollspannung in Volt
+void setVoltage(float volts) {
+  uint16_t reg = (uint16_t)(volts * 100.0f);   // /100 laut Registermap
+  sk120.writeSingleRegister(0x0000, reg);
 }
 
-float readBatteryVoltage() {
-  int raw     = readAdcAveraged(PIN_BAT_ADC);
-  float v_adc = (float)raw * ADC_REF_V / (float)ADC_MAX;
-  float v_bat = v_adc * (R_DIV_TOP + R_DIV_BOTTOM) / R_DIV_BOTTOM;
-  return v_bat * CAL_VOLTAGE_FACTOR;
+// Sollstrom in Ampere
+void setCurrent(float amps) {
+  uint16_t reg = (uint16_t)(amps * 1000.0f);   // /1000 laut Registermap
+  sk120.writeSingleRegister(0x0001, reg);
 }
 
-float readShuntCurrent() {
-  int raw      = readAdcAveraged(PIN_SHUNT_ADC);
-  float v_shunt = (float)raw * ADC_REF_V / (float)ADC_MAX;
-  float current = v_shunt / R_SHUNT;
-  return current * CAL_CURRENT_FACTOR;
+// Ausgang ein/aus
+void setOutput(bool on) {
+  sk120.writeSingleRegister(0x0012, on ? 1 : 0);
+  out_on = on;
 }
 
-
-// ==========================================
-//            IR-MESSUNG MIT MITTELWERT
-// ==========================================
-void performIRMeasurement() {
-  g_isMeasuring = true;
-
-  float sum_v_open = 0.0f;
-  float sum_v_load = 0.0f;
-  float sum_i_load = 0.0f;
-
-  for (int i = 0; i < IR_SAMPLES; i++) {
-    // Leerlauf
-    digitalWrite(PIN_LOAD_FET, LOW);
-    delay(IR_DELAY_OPEN_MS);
-    float v_open = readBatteryVoltage();
-
-    // Unter Last
-    digitalWrite(PIN_LOAD_FET, HIGH);
-    delay(IR_DELAY_LOAD_MS);
-    float v_load = readBatteryVoltage();
-    float i_load = readShuntCurrent();
-
-    // Last aus
-    digitalWrite(PIN_LOAD_FET, LOW);
-
-    sum_v_open += v_open;
-    sum_v_load += v_load;
-    sum_i_load += i_load;
+// Werte holen
+void readValues() {
+  // 0x0000/0x0001 = Sollwerte
+  uint8_t res1 = sk120.readHoldingRegisters(0x0000, 2);
+  if (res1 == sk120.ku8MBSuccess) {
+    u_set = sk120.getResponseBuffer(0) / 100.0f;
+    i_set = sk120.getResponseBuffer(1) / 1000.0f;
   }
 
-  g_v_open = sum_v_open / IR_SAMPLES;
-  g_v_load = sum_v_load / IR_SAMPLES;
-  g_i_load = sum_i_load / IR_SAMPLES;
+  // 0x0002,0x0003,0x0004 = U/I/P Ist
+  uint8_t res2 = sk120.readHoldingRegisters(0x0002, 3);
+  if (res2 == sk120.ku8MBSuccess) {
+    u_meas = sk120.getResponseBuffer(0) / 100.0f;
+    i_meas = sk120.getResponseBuffer(1) / 1000.0f;
+    p_meas = sk120.getResponseBuffer(2) / 100.0f;
+  }
 
-  if (g_i_load > IR_MIN_CURRENT_A) {
-    g_r_int   = (g_v_open - g_v_load) / g_i_load;
-    g_validIR = true;
+  // 0x0012 = Output state
+  uint8_t res3 = sk120.readHoldingRegisters(0x0012, 1);
+  if (res3 == sk120.ku8MBSuccess) {
+    out_on = sk120.getResponseBuffer(0) == 1;
+  }
+}
+
+// ---------- Webserver Handler ----------
+
+String htmlPage() {
+  String html = F(
+    "<!DOCTYPE html><html><head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+    "<style>"
+    "body{font-family:sans-serif;background:#111;color:#eee;text-align:center;}"
+    ".card{display:inline-block;margin:10px;padding:15px;border-radius:10px;background:#222;}"
+    "h1{font-size:22px;margin-bottom:10px;}"
+    "table{margin:0 auto;}"
+    "td{padding:4px 10px;}"
+    "a.btn{display:inline-block;margin:8px;padding:8px 16px;border-radius:6px;"
+    "text-decoration:none;color:#000;background:#4caf50;}"
+    "a.btn.off{background:#f44336;color:#fff;}"
+    "input{width:80px;padding:4px;border-radius:4px;border:1px solid #555;background:#000;color:#fff;text-align:right;}"
+    "</style></head><body>"
+    "<h1>XY-SK120 Control</h1>"
+    "<div class='card'><table>"
+  );
+
+  html += "<tr><td>U Ist:</td><td>" + String(u_meas, 2) + " V</td></tr>";
+  html += "<tr><td>I Ist:</td><td>" + String(i_meas, 3) + " A</td></tr>";
+  html += "<tr><td>P Ist:</td><td>" + String(p_meas, 1) + " W</td></tr>";
+  html += "<tr><td>U Soll:</td><td>" + String(u_set, 2) + " V</td></tr>";
+  html += "<tr><td>I Soll:</td><td>" + String(i_set, 3) + " A</td></tr>";
+  html += "<tr><td>Output:</td><td>" + String(out_on ? "ON" : "OFF") + "</td></tr>";
+
+  html += F("</table></div><br/>");
+
+  // einfache Form zum Setzen von U/I
+  html += F(
+    "<div class='card'>"
+    "<form action='/set' method='get'>"
+    "U[V]: <input name='u' type='number' step='0.01'/><br/>"
+    "I[A]: <input name='i' type='number' step='0.001'/><br/><br/>"
+    "<input type='submit' value='Set' />"
+    "</form></div><br/>"
+  );
+
+  // Buttons Output an/aus
+  if (out_on) {
+    html += "<a class='btn off' href='/out?state=0'>Output OFF</a>";
   } else {
-    g_r_int   = 0;
-    g_validIR = false;
+    html += "<a class='btn' href='/out?state=1'>Output ON</a>";
   }
 
-  g_isMeasuring = false;
-}
+  html += F("<p style='margin-top:20px;font-size:12px;color:#888;'>Reload zum Aktualisieren.</p>");
 
-
-// ==========================================
-//              WEB-INTERFACE
-// ==========================================
-
-String formatFloat(float v, uint8_t d = 3) {
-  char b[32];
-  dtostrf(v, 0, d, b);
-  return String(b);
+  html += F("</body></html>");
+  return html;
 }
 
 void handleRoot() {
-  String html =
-    "<!DOCTYPE html><html><head>"
-    "<meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>18650 Tester</title>"
-    "<style>"
-    "body{font-family:Arial;background:#111;color:#eee;padding:10px;}"
-    ".card{background:#222;padding:10px;margin-bottom:10px;border-radius:6px;}"
-    "button{padding:8px 16px;border:none;background:#28a745;color:#fff;border-radius:4px;font-size:1rem;cursor:pointer;}"
-    "button:hover{background:#218838;}"
-    "a.btn{padding:8px 16px;background:#007bff;color:#fff;border-radius:4px;text-decoration:none;}"
-    "</style>"
-    "</head><body>";
-
-  html += "<h1>18650 Tester (AP)</h1>";
-
-  html += "<div class='card'><h2>Leerlaufspannung</h2>";
-  html += "<p>U<sub>batt</sub>: <span id='idle'>-</span> V</p>";
-  html += "</div>";
-
-  html += "<div class='card'><h2>Innenwiderstand</h2>";
-  html += "<p>V<sub>open</sub>: <span id='v_open'>-</span> V</p>";
-  html += "<p>V<sub>load</sub>: <span id='v_load'>-</span> V</p>";
-  html += "<p>I<sub>load</sub>: <span id='i_load'>-</span> A</p>";
-  html += "<p>R<sub>int</sub>: <span id='rint'>-</span> mΩ</p>";
-  html += "<form action='/measure'><button>IR-Messung starten</button></form>";
-  html += "</div>";
-
-  html += "<div class='card'><h2>Firmware</h2>";
-  html += "<a class='btn' href='/update'>Firmware-Update</a>";
-  html += "</div>";
-
-  html +=
-    "<script>"
-    "function upd(){"
-    "fetch('/data').then(r=>r.json()).then(j=>{"
-    "document.getElementById('idle').textContent  = j.ubatt_idle.toFixed(3);"
-    "document.getElementById('v_open').textContent= j.v_open.toFixed(3);"
-    "document.getElementById('v_load').textContent= j.v_load.toFixed(3);"
-    "document.getElementById('i_load').textContent= j.i_load.toFixed(3);"
-    "document.getElementById('rint').textContent  = j.valid_ir ? (j.r_int_milliohm.toFixed(1)) : '-';"
-    "});}"
-    "setInterval(upd,1000);"
-    "upd();"
-    "</script>";
-
-  html += "</body></html>";
-
-  server.send(200, "text/html", html);
+  readValues();
+  server.send(200, "text/html", htmlPage());
 }
 
-void handleData() {
-  String json = "{";
-  json += "\"ubatt_idle\":"     + String(g_v_idle, 4) + ",";
-  json += "\"v_open\":"         + String(g_v_open, 4) + ",";
-  json += "\"v_load\":"         + String(g_v_load, 4) + ",";
-  json += "\"i_load\":"         + String(g_i_load, 4) + ",";
-  json += "\"r_int_milliohm\":" + String(g_r_int * 1000.0f, 3) + ",";
-  json += "\"valid_ir\":"       + String(g_validIR ? "true" : "false");
-  json += "}";
-  server.send(200, "application/json", json);
+void handleSet() {
+  if (server.hasArg("u")) {
+    float u = server.arg("u").toFloat();
+    if (u > 0 && u <= 36.0) {
+      setVoltage(u);
+    }
+  }
+  if (server.hasArg("i")) {
+    float i = server.arg("i").toFloat();
+    if (i > 0 && i <= 6.0) {
+      setCurrent(i);
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303); // redirect
 }
 
-void handleMeasure() {
-  if (!g_isMeasuring) performIRMeasurement();
+void handleOut() {
+  if (server.hasArg("state")) {
+    String s = server.arg("state");
+    if (s == "1") setOutput(true);
+    else         setOutput(false);
+  }
   server.sendHeader("Location", "/");
   server.send(303);
 }
 
-
-// ==========================================
-//                WEB-OTA
-// ==========================================
-
-const char* updateForm = R"(
-<!DOCTYPE html><html><head>
-<meta charset='utf-8'>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Firmware Update</title>
-<style>
-body{font-family:Arial;background:#111;color:#eee;padding:10px;}
-.card{background:#222;padding:10px;border-radius:6px;}
-button{padding:8px 16px;background:#007bff;color:#fff;border:none;border-radius:4px;}
-</style>
-</head><body>
-<h1>Firmware-Update</h1>
-<div class='card'>
-<form method='POST' action='/update' enctype='multipart/form-data'>
-<input type='file' name='update'><br><br>
-<button>Flash .bin</button>
-</form>
-</div>
-<p><a href='/'>Zurück</a></p>
-</body></html>
-)";
-
-void handleUpdatePage() {
-  server.send(200, "text/html", updateForm);
-}
-
-void handleUpdateUpload() {
-  HTTPUpload& u = server.upload();
-
-  if (u.status == UPLOAD_FILE_START) {
-    Update.begin();
-  } else if (u.status == UPLOAD_FILE_WRITE) {
-    Update.write(u.buf, u.currentSize);
-  } else if (u.status == UPLOAD_FILE_END) {
-    Update.end(true);
-  }
-}
-
-void handleUpdateFinish() {
-  if (Update.hasError())
-    server.send(200, "text/plain", "Update fehlgeschlagen");
-  else {
-    server.send(200, "text/plain", "Update OK – Neustart...");
-    delay(500);
-    ESP.restart();
-  }
-}
-
-
-// ==========================================
-//               AP-MODUS
-// ==========================================
-void setupWifi() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-
-  Serial.println("Access-Point gestartet:");
-  Serial.print("SSID: "); Serial.println(AP_SSID);
-  Serial.print("Passwort: "); Serial.println(AP_PASSWORD);
-  Serial.print("AP-IP: "); Serial.println(WiFi.softAPIP());
-}
-
-
-// ==========================================
-//                 SETUP / LOOP
-// ==========================================
-void setupWebServer() {
-  server.on("/", handleRoot);
-  server.on("/data", handleData);
-  server.on("/measure", handleMeasure);
-
-  server.on("/update", HTTP_GET, handleUpdatePage);
-  server.on("/update", HTTP_POST, handleUpdateFinish, handleUpdateUpload);
-
-  server.begin();
-}
+// ---------- Setup / Loop ----------
 
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_0db);
+  // UART2 für SK120
+  SKSerial.begin(9600, SERIAL_8N1, SK120_RX_PIN, SK120_TX_PIN);
+  sk120.begin(1, SKSerial); // Slave-ID 1
 
-  pinMode(PIN_LOAD_FET, OUTPUT);
-  digitalWrite(PIN_LOAD_FET, LOW);
+  // WiFi AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("AP IP: ");
+  Serial.println(ip);
 
-  setupWifi();
-  setupWebServer();
+  // Webserver Routen
+  server.on("/", handleRoot);
+  server.on("/set", handleSet);
+  server.on("/out", handleOut);
+  server.begin();
+  Serial.println("HTTP server gestartet");
 }
 
 void loop() {
   server.handleClient();
-
-  static unsigned long last = 0;
-  if (millis() - last >= 1000 && !g_isMeasuring) {
-    last = millis();
-    g_v_idle = readBatteryVoltage();
-  }
 }
