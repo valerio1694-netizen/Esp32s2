@@ -41,13 +41,13 @@ jobs:
           arduino-cli core install "${ESP32_CORE}"
           arduino-cli core list
 
-      - name: Install libraries
+      - name: Install libraries (RobotArm / PCA9685)
         run: |
           set -euxo pipefail
-          # WiFi ist im ESP32-Core schon enthalten, muss nicht installiert werden
-          arduino-cli lib install "PubSubClient"
-          # Für SK120/Modbus (falls im Sketch verwendet)
-          arduino-cli lib install "ModbusMaster"
+          # Für PCA9685:
+          arduino-cli lib install "Adafruit PWM Servo Driver Library"
+          # Dependency:
+          arduino-cli lib install "Adafruit BusIO"
 
       - name: Compile firmware
         run: |
