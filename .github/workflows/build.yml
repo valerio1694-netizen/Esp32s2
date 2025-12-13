@@ -16,7 +16,7 @@ jobs:
     env:
       CLI_VERSION: "0.35.3"
       ESP32_CORE: "esp32:esp32@2.0.17"
-      FQBN: "esp32:esp32:esp32"   # ESP32 Dev Module
+      FQBN: "esp32:esp32:esp32"
 
     steps:
       - name: Checkout repository
@@ -34,13 +34,13 @@ jobs:
       - name: Install ESP32 core
         run: |
           set -euxo pipefail
-          arduino-cli config init --overwrite
+          arduino-cli config init
           arduino-cli config set board_manager.additional_urls "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"
           arduino-cli core update-index
           arduino-cli core install "${ESP32_CORE}"
           arduino-cli core list
 
-      - name: Install libraries (PCA9685)
+      - name: Install libraries
         run: |
           set -euxo pipefail
           arduino-cli lib update-index
@@ -62,8 +62,8 @@ jobs:
       - name: List build output (debug)
         run: |
           set -euxo pipefail
-          ls -la "$GITHUB_WORKSPACE/build"
-          find "$GITHUB_WORKSPACE/build" -maxdepth 2 -type f
+          ls -lah "$GITHUB_WORKSPACE/build"
+          find "$GITHUB_WORKSPACE/build" -maxdepth 2 -type f -print
 
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
@@ -72,3 +72,4 @@ jobs:
           path: |
             build/**/*.bin
             build/**/*.elf
+            build/**/*.map
