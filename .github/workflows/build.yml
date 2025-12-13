@@ -22,7 +22,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Arduino CLI
+      - name: Install Arduino CLI (${{ env.CLI_VERSION }})
         run: |
           set -euxo pipefail
           cd /tmp
@@ -31,7 +31,7 @@ jobs:
           sudo mv arduino-cli /usr/local/bin/
           arduino-cli version
 
-      - name: Install ESP32 core
+      - name: Add ESP32 package index & install core
         run: |
           set -euxo pipefail
           arduino-cli config init
@@ -40,14 +40,13 @@ jobs:
           arduino-cli core install "${ESP32_CORE}"
           arduino-cli core list
 
-      - name: Install libraries
+      - name: Install libraries (PCA9685)
         run: |
           set -euxo pipefail
-          arduino-cli lib update-index
           arduino-cli lib install "Adafruit PWM Servo Driver Library"
           arduino-cli lib install "Adafruit BusIO"
 
-      - name: Compile firmware (EXPORT BIN)
+      - name: Compile firmware (export .bin)
         run: |
           set -euxo pipefail
           mkdir -p "$GITHUB_WORKSPACE/build"
@@ -55,15 +54,14 @@ jobs:
             --fqbn "${FQBN}" \
             --warnings default \
             --export-binaries \
-            --output-dir "$GITHUB_WORKSPACE/build" \
-            --verbose \
+            --build-path "$GITHUB_WORKSPACE/build" \
             firmware/firmware.ino
 
       - name: List build output (debug)
         run: |
           set -euxo pipefail
-          ls -lah "$GITHUB_WORKSPACE/build"
-          find "$GITHUB_WORKSPACE/build" -maxdepth 2 -type f -print
+          ls -lah "$GITHUB_WORKSPACE/build" || true
+          find "$GITHUB_WORKSPACE/build" -maxdepth 3 -type f -print || true
 
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
@@ -72,4 +70,4 @@ jobs:
           path: |
             build/**/*.bin
             build/**/*.elf
-            build/**/*.map
+            build/**/partitions*.csv
