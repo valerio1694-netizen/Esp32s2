@@ -41,13 +41,17 @@ jobs:
           arduino-cli core install "${ESP32_CORE}"
           arduino-cli core list
 
-      - name: Install libraries (RobotArm / PCA9685)
+      - name: Update library index
         run: |
           set -euxo pipefail
-          # Für PCA9685:
-          arduino-cli lib install "Adafruit PWM Servo Driver Library"
-          # Dependency:
-          arduino-cli lib install "Adafruit BusIO"
+          arduino-cli lib update-index
+
+      - name: Install libraries (pinned)
+        run: |
+          set -euxo pipefail
+          # PCA9685 / Servo (aktuell, gepinnt):
+          arduino-cli lib install "Adafruit PWM Servo Driver Library@3.0.2"
+          arduino-cli lib install "Adafruit BusIO@1.17.4"
 
       - name: Compile firmware
         run: |
