@@ -3,157 +3,239 @@
 #include <Update.h>
 #include <Wire.h>
 #include <Preferences.h>
+
 #include <Adafruit_PWMServoDriver.h>
 
-/* ========= CONFIG ========= */
-#define SERVO_COUNT 6
-#define SERVO_FREQ  50        // 50 Hz für analoge Servos
-#define AP_SSID     "ESP32-RobotArm"
-#define AP_PASS     "12345678"
+// ========= Config =========
+static const char* AP_SSID = "RobotArm-Calib";
+static const char* AP_PASS = "12345678"; // mind. 8 Zeichen
 
-// PCA9685 Adresse
+// PCA9685
 Adafruit_PWMServoDriver pca(0x40);
-WebServer server(80);
+
+// Servo settings (typisch)
+static const uint16_t SERVO_FREQ = 50;      // 50Hz
+static const uint16_t PULSE_MIN_US = 500;   // meist 500-600us
+static const uint16_t PULSE_MAX_US = 2500;  // meist 2400-2500us
+
+// 6 Achsen: Base, Schulter, Ellenbogen, Drehen, Kippen, Greifen
+static const int SERVO_COUNT = 6;
+static const char* SERVO_NAME[SERVO_COUNT] = {
+  "Base", "Schulter", "Ellenbogen", "Drehen", "Kippen", "Greifen"
+};
+
+// PCA-Kanäle 0..5
+static const uint8_t SERVO_CH[SERVO_COUNT] = {0,1,2,3,4,5};
+
 Preferences prefs;
+WebServer server(80);
 
-// Servo-Kanäle (anpassen falls nötig)
-uint8_t servoCh[SERVO_COUNT] = {0,1,2,3,4,5};
+// gespeicherte Home-Positionen (Grad)
+int homeDeg[SERVO_COUNT] = {90,90,90,90,90,90};
+int curDeg[SERVO_COUNT]  = {90,90,90,90,90,90};
 
-// Kalibrierwerte
-uint16_t sMin[SERVO_COUNT];
-uint16_t sMax[SERVO_COUNT];
-uint16_t sHome[SERVO_COUNT];
-uint16_t sCur[SERVO_COUNT];
-
-uint8_t activeServo = 0;
-uint16_t stepUS = 5;
-
-/* ========= HELPER ========= */
-uint16_t usToTicks(uint16_t us){
-  return (uint32_t)us * SERVO_FREQ * 4096 / 1000000;
+static uint16_t usToPcaTicks(uint16_t microseconds) {
+  // PCA9685 hat 4096 steps pro Periode
+  // Periodendauer bei 50Hz = 20ms = 20000us
+  // ticks = us * 4096 / 20000
+  const uint32_t ticks = (uint32_t)microseconds * 4096UL / 20000UL;
+  return (uint16_t)ticks;
 }
 
-void moveServo(uint8_t i, uint16_t us){
-  us = constrain(us, 300, 3000);
-  sCur[i] = us;
-  pca.setPWM(servoCh[i], 0, usToTicks(us));
+static uint16_t degToUs(int deg) {
+  if (deg < 0) deg = 0;
+  if (deg > 180) deg = 180;
+  const uint32_t us = PULSE_MIN_US + (uint32_t)(PULSE_MAX_US - PULSE_MIN_US) * (uint32_t)deg / 180UL;
+  return (uint16_t)us;
 }
 
-/* ========= STORAGE ========= */
-void loadCal(){
-  prefs.begin("cal", true);
-  for(int i=0;i<SERVO_COUNT;i++){
-    sMin[i]  = prefs.getUShort(String("min")+i, 500);
-    sMax[i]  = prefs.getUShort(String("max")+i, 2500);
-    sHome[i] = prefs.getUShort(String("home")+i,1500);
-    sCur[i]  = sHome[i];
+static void setServoDeg(int idx, int deg) {
+  if (idx < 0 || idx >= SERVO_COUNT) return;
+  if (deg < 0) deg = 0;
+  if (deg > 180) deg = 180;
+
+  curDeg[idx] = deg;
+  uint16_t us = degToUs(deg);
+  uint16_t ticks = usToPcaTicks(us);
+
+  // setPWM(channel, on, off)
+  pca.setPWM(SERVO_CH[idx], 0, ticks);
+}
+
+static void loadHomes() {
+  prefs.begin("robotarm", true);
+  for (int i=0;i<SERVO_COUNT;i++) {
+    String key = String("h") + i;
+    homeDeg[i] = prefs.getInt(key.c_str(), 90);
+    curDeg[i] = homeDeg[i];
   }
   prefs.end();
 }
 
-void saveCal(){
-  prefs.begin("cal", false);
-  for(int i=0;i<SERVO_COUNT;i++){
-    prefs.putUShort(String("min")+i,  sMin[i]);
-    prefs.putUShort(String("max")+i,  sMax[i]);
-    prefs.putUShort(String("home")+i, sHome[i]);
+static void saveHomes() {
+  prefs.begin("robotarm", false);
+  for (int i=0;i<SERVO_COUNT;i++) {
+    String key = String("h") + i;
+    prefs.putInt(key.c_str(), homeDeg[i]);
   }
   prefs.end();
 }
 
-/* ========= WEB ========= */
-String stateJson(){
-  String j="{\"servo\":"+String(activeServo)+",\"step\":"+String(stepUS)+",\"data\":[";
-  for(int i=0;i<SERVO_COUNT;i++){
-    if(i) j+=",";
-    j+="{\"min\":"+String(sMin[i])+",\"max\":"+String(sMax[i])+
-       ",\"home\":"+String(sHome[i])+",\"cur\":"+String(sCur[i])+"}";
+static String htmlPage() {
+  String s;
+  s.reserve(6000);
+  s += "<!doctype html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  s += "<title>RobotArm Kalibrierung</title>";
+  s += "<style>body{font-family:Arial;margin:20px;background:#0b0b0b;color:#eaeaea}"
+       ".card{background:#161616;padding:14px;border-radius:12px;margin:10px 0}"
+       "input[type=range]{width:100%} .row{display:flex;gap:10px;align-items:center}"
+       "button{padding:10px 14px;border:0;border-radius:10px;margin:6px 6px 0 0}"
+       ".ok{background:#2e7d32;color:#fff} .warn{background:#b71c1c;color:#fff} a{color:#66aaff}"
+       "</style></head><body>";
+  s += "<h2>RobotArm Kalibrierung</h2>";
+  s += "<div class='card'><b>Web OTA:</b> <a href='/ota'>hier</a></div>";
+
+  for (int i=0;i<SERVO_COUNT;i++) {
+    s += "<div class='card'>";
+    s += "<div class='row'><b>";
+    s += SERVO_NAME[i];
+    s += "</b><span id='v";
+    s += i;
+    s += "'>";
+    s += String(curDeg[i]);
+    s += "</span>°</div>";
+    s += "<input type='range' min='0' max='180' value='";
+    s += String(curDeg[i]);
+    s += "' oninput='setS(";
+    s += i;
+    s += ", this.value)'>";
+    s += "<div class='row'>";
+    s += "<button class='ok' onclick='setHome(";
+    s += i;
+    s += ")'>Als HOME speichern</button>";
+    s += "</div></div>";
   }
-  j+="]}";
-  return j;
+
+  s += "<div class='card'>";
+  s += "<button class='ok' onclick='goHome()'>Alle auf HOME</button>";
+  s += "<button class='warn' onclick='saveAll()'>HOME Werte speichern</button>";
+  s += "</div>";
+
+  s += "<script>"
+       "async function setS(i,val){document.getElementById('v'+i).innerText=val;"
+       "await fetch(`/api/set?id=${i}&deg=${val}`);}"
+       "async function setHome(i){await fetch(`/api/sethome?id=${i}`);}"
+       "async function goHome(){await fetch('/api/gohome'); location.reload();}"
+       "async function saveAll(){await fetch('/api/save'); alert('gespeichert');}"
+       "</script>";
+
+  s += "</body></html>";
+  return s;
 }
 
-const char PAGE[] PROGMEM = R"HTML(
-<!doctype html><html><body style="background:#111;color:#0af;font-family:sans-serif">
-<h2>Servo Kalibrierung</h2>
-<p>Servo: <select id=s onchange=sel()></select>
-Step: <input id=st type=number value=5 onchange=step()></p>
-<button onclick=mv(-1)>-</button>
-<button onclick=mv(1)>+</button><br><br>
-<button onclick=setm()>SET MIN</button>
-<button onclick=setx()>SET MAX</button>
-<button onclick=seth()>SET HOME</button>
-<button onclick=save()>SAVE</button>
-<p><a href="/ota">OTA Update</a></p>
-<pre id=o></pre>
-<script>
-async function api(q){return fetch('/api?'+q).then(r=>r.json())}
-async function upd(){
- let d=await api('state');
- o.textContent=JSON.stringify(d,null,2);
- s.innerHTML='';
- d.data.forEach((_,i)=>{let o=document.createElement('option');o.value=i;o.text='Servo '+(i+1);s.appendChild(o)})
- s.value=d.servo; st.value=d.step;
-}
-async function sel(){await api('sel='+s.value);upd()}
-async function step(){await api('step='+st.value);upd()}
-async function mv(d){await api('mv='+d);upd()}
-async function setm(){await api('min');upd()}
-async function setx(){await api('max');upd()}
-async function seth(){await api('home');upd()}
-async function save(){await api('save');alert('Gespeichert')}
-upd();
-</script></body></html>
-)HTML";
-
-/* ========= API ========= */
-void handleApi(){
-  if(server.hasArg("state")) { server.send(200,"application/json",stateJson()); return; }
-  if(server.hasArg("sel"))   activeServo=server.arg("sel").toInt();
-  if(server.hasArg("step"))  stepUS=server.arg("step").toInt();
-  if(server.hasArg("mv"))    moveServo(activeServo, sCur[activeServo]+stepUS*server.arg("mv").toInt());
-  if(server.hasArg("min"))   sMin[activeServo]=sCur[activeServo];
-  if(server.hasArg("max"))   sMax[activeServo]=sCur[activeServo];
-  if(server.hasArg("home"))  sHome[activeServo]=sCur[activeServo];
-  if(server.hasArg("save"))  saveCal();
-  server.send(200,"application/json",stateJson());
+// --- OTA page ---
+static String otaPage() {
+  return String(
+    "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>OTA Update</title>"
+    "<style>body{font-family:Arial;margin:20px;background:#0b0b0b;color:#eaeaea}"
+    ".card{background:#161616;padding:14px;border-radius:12px;margin:10px 0}"
+    "button{padding:10px 14px;border:0;border-radius:10px;background:#2e7d32;color:#fff}"
+    "a{color:#66aaff}</style></head><body>"
+    "<h2>Web OTA</h2>"
+    "<div class='card'>Firmware .bin auswählen und hochladen. Danach reboot.</div>"
+    "<form method='POST' action='/update' enctype='multipart/form-data'>"
+    "<input type='file' name='update' accept='.bin' required>"
+    "<button type='submit'>Upload</button>"
+    "</form>"
+    "<div class='card'><a href='/'>zurück</a></div>"
+    "</body></html>"
+  );
 }
 
-/* ========= OTA ========= */
-void otaUpload(){
-  HTTPUpload& u=server.upload();
-  if(u.status==UPLOAD_FILE_START) Update.begin();
-  else if(u.status==UPLOAD_FILE_WRITE) Update.write(u.buf,u.currentSize);
-  else if(u.status==UPLOAD_FILE_END) Update.end(true);
-}
+void setup() {
+  Serial.begin(115200);
+  delay(200);
 
-void otaDone(){
-  server.send(200,"text/plain","OK");
-  delay(300); ESP.restart();
-}
-
-/* ========= SETUP ========= */
-void setup(){
-  Wire.begin();
+  // I2C + PCA
+  Wire.begin(); // ESP32 default SDA=21 SCL=22
   pca.begin();
+  pca.setOscillatorFrequency(27000000);
   pca.setPWMFreq(SERVO_FREQ);
 
-  loadCal();
-  for(int i=0;i<SERVO_COUNT;i++) moveServo(i,sHome[i]);
+  loadHomes();
+  for (int i=0;i<SERVO_COUNT;i++) setServoDeg(i, curDeg[i]);
 
-  WiFi.softAP(AP_SSID,AP_PASS);
+  // WiFi AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(200);
 
-  server.on("/",[](){server.send_P(200,"text/html",PAGE);});
-  server.on("/api",handleApi);
-  server.on("/ota",[](){
-    server.send(200,"text/html",
-      "<form method=POST action=/update enctype=multipart/form-data>"
-      "<input type=file name=update><input type=submit></form>");
+  // Routes
+  server.on("/", HTTP_GET, [](){ server.send(200, "text/html", htmlPage()); });
+
+  server.on("/api/set", HTTP_GET, [](){
+    if (!server.hasArg("id") || !server.hasArg("deg")) { server.send(400, "text/plain", "bad args"); return; }
+    int id  = server.arg("id").toInt();
+    int deg = server.arg("deg").toInt();
+    setServoDeg(id, deg);
+    server.send(200, "text/plain", "ok");
   });
-  server.on("/update",HTTP_POST,otaDone,otaUpload);
+
+  server.on("/api/sethome", HTTP_GET, [](){
+    if (!server.hasArg("id")) { server.send(400, "text/plain", "bad args"); return; }
+    int id = server.arg("id").toInt();
+    if (id < 0 || id >= SERVO_COUNT) { server.send(400, "text/plain", "bad id"); return; }
+    homeDeg[id] = curDeg[id];
+    server.send(200, "text/plain", "ok");
+  });
+
+  server.on("/api/gohome", HTTP_GET, [](){
+    for (int i=0;i<SERVO_COUNT;i++) setServoDeg(i, homeDeg[i]);
+    server.send(200, "text/plain", "ok");
+  });
+
+  server.on("/api/save", HTTP_GET, [](){
+    saveHomes();
+    server.send(200, "text/plain", "ok");
+  });
+
+  // OTA endpoints
+  server.on("/ota", HTTP_GET, [](){ server.send(200, "text/html", otaPage()); });
+
+  server.on("/update", HTTP_POST,
+    []() {
+      // finished
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK - reboot");
+      delay(200);
+      ESP.restart();
+    },
+    []() {
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (!Update.end(true)) {
+          Update.printError(Serial);
+        }
+      }
+    }
+  );
+
   server.begin();
+
+  Serial.println("AP ready:");
+  Serial.print("SSID: "); Serial.println(AP_SSID);
+  Serial.print("IP:   "); Serial.println(WiFi.softAPIP());
 }
 
-void loop(){
+void loop() {
   server.handleClient();
 }
