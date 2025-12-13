@@ -23,7 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Arduino CLI (${{ env.CLI_VERSION }})
+      - name: Install Arduino CLI
         run: |
           set -euxo pipefail
           cd /tmp
@@ -32,24 +32,22 @@ jobs:
           sudo mv arduino-cli /usr/local/bin/
           arduino-cli version
 
-      - name: Add ESP32 package index & install core
+      - name: Install ESP32 core
         run: |
           set -euxo pipefail
           arduino-cli config init
-          arduino-cli config set board_manager.additional_urls "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"
+          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install "${ESP32_CORE}"
-          arduino-cli core list
 
       - name: Update library index
         run: |
           set -euxo pipefail
           arduino-cli lib update-index
 
-      - name: Install libraries (pinned)
+      - name: Install required libraries
         run: |
           set -euxo pipefail
-          # PCA9685 / Servo (aktuell, gepinnt):
           arduino-cli lib install "Adafruit PWM Servo Driver Library@3.0.2"
           arduino-cli lib install "Adafruit BusIO@1.17.4"
 
@@ -62,10 +60,16 @@ jobs:
             --build-path "$GITHUB_WORKSPACE/build" \
             firmware/firmware.ino
 
-      - name: Upload firmware artifacts
+      - name: Show build output
+        run: |
+          set -euxo pipefail
+          find "$GITHUB_WORKSPACE/build" -type f
+
+      - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-devmodule-firmware
+          name: esp32-firmware
+          if-no-files-found: error
           path: |
-            build/*.bin
-            build/*.elf
+            build/**/*.bin
+            build/**/*.elf
