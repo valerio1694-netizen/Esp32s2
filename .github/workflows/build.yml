@@ -44,6 +44,7 @@ jobs:
           set -euxo pipefail
           arduino-cli lib install "Adafruit PWM Servo Driver Library"
           arduino-cli lib install "Adafruit BusIO"
+          arduino-cli lib install "adafruit NeoPixel"
 
       - name: Compile firmware (EXPORT BIN)
         run: |
