@@ -22,7 +22,6 @@ jobs:
           arduino-cli config init --overwrite
           arduino-cli config set directories.user "$GITHUB_WORKSPACE/.arduino"
           mkdir -p "$GITHUB_WORKSPACE/.arduino/libraries"
-          arduino-cli config dump
 
       - name: Install ESP32 core
         run: |
@@ -30,17 +29,13 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
-      - name: Install libraries (with verification)
+      - name: Install libraries
         run: |
           set -euxo pipefail
           arduino-cli lib update-index
           arduino-cli lib install "Adafruit NeoPixel"
-          echo "---- lib list ----"
-          arduino-cli lib list | grep -i "neopixel\|adafruit" || true
-          echo "---- find header ----"
-          find "$GITHUB_WORKSPACE/.arduino/libraries" -maxdepth 4 -iname "Adafruit_NeoPixel.h" -print || true
 
-      - name: Compile firmware
+      - name: Compile firmware (export binaries)
         run: |
           set -euxo pipefail
           mkdir -p build
@@ -48,5 +43,19 @@ jobs:
             --fqbn esp32:esp32:esp32 \
             --libraries "$GITHUB_WORKSPACE/.arduino/libraries" \
             --export-binaries \
-            --output-dir build \
+            --output-dir "$GITHUB_WORKSPACE/build" \
             firmware/firmware.ino
+
+          echo "== build output =="
+          ls -lah "$GITHUB_WORKSPACE/build"
+          find "$GITHUB_WORKSPACE/build" -maxdepth 2 -type f -name "*.bin" -print
+
+      - name: Upload firmware binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-firmware-bin
+          path: |
+            build/*.bin
+            build/*.elf
+            build/*.map
+          if-no-files-found: error
