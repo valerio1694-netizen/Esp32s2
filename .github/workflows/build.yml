@@ -11,24 +11,42 @@ jobs:
 
       - name: Install Arduino CLI
         run: |
+          set -euxo pipefail
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
           sudo mv bin/arduino-cli /usr/local/bin/
+          arduino-cli version
+
+      - name: Configure Arduino CLI (fixed sketchbook in repo)
+        run: |
+          set -euxo pipefail
+          arduino-cli config init --overwrite
+          arduino-cli config set directories.user "$GITHUB_WORKSPACE/.arduino"
+          mkdir -p "$GITHUB_WORKSPACE/.arduino/libraries"
+          arduino-cli config dump
 
       - name: Install ESP32 core
         run: |
+          set -euxo pipefail
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
-      - name: Install libraries
+      - name: Install libraries (with verification)
         run: |
+          set -euxo pipefail
           arduino-cli lib update-index
           arduino-cli lib install "Adafruit NeoPixel"
+          echo "---- lib list ----"
+          arduino-cli lib list | grep -i "neopixel\|adafruit" || true
+          echo "---- find header ----"
+          find "$GITHUB_WORKSPACE/.arduino/libraries" -maxdepth 4 -iname "Adafruit_NeoPixel.h" -print || true
 
       - name: Compile firmware
         run: |
+          set -euxo pipefail
           mkdir -p build
           arduino-cli compile \
             --fqbn esp32:esp32:esp32 \
+            --libraries "$GITHUB_WORKSPACE/.arduino/libraries" \
             --export-binaries \
             --output-dir build \
             firmware/firmware.ino
