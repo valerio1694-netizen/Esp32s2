@@ -1,239 +1,229 @@
+/************************************************************
+ * ESP32 RobotArm – Web UI + Web OTA + WS2812 Status LEDs
+ * Board: ESP32 DevKit (AZ-Delivery ESP32-WROOM-32)
+ *
+ * LED Ring (44x WS2812B): GPIO16
+ * Schaltschrank (10x WS2812B): GPIO17 (weiß, dimmbar)
+ * I2C (PCA9685): SDA=GPIO21, SCL=GPIO22
+ ************************************************************/
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
 #include <Wire.h>
-#include <Preferences.h>
+#include <Adafruit_NeoPixel.h>
 
-#include <Adafruit_PWMServoDriver.h>
+// ====== Pins / Counts ======
+#define PIN_RING        16
+#define PIN_CABINET     17
+#define LEDS_RING       44
+#define LEDS_CABINET    10
 
-// ========= Config =========
-static const char* AP_SSID = "RobotArm-Calib";
-static const char* AP_PASS = "12345678"; // mind. 8 Zeichen
+#define I2C_SDA         21
+#define I2C_SCL         22
 
-// PCA9685
-Adafruit_PWMServoDriver pca(0x40);
+// ====== WiFi AP ======
+const char* AP_SSID = "RobotArm";
+const char* AP_PASS = "12345678";  // mind. 8 Zeichen
 
-// Servo settings (typisch)
-static const uint16_t SERVO_FREQ = 50;      // 50Hz
-static const uint16_t PULSE_MIN_US = 500;   // meist 500-600us
-static const uint16_t PULSE_MAX_US = 2500;  // meist 2400-2500us
-
-// 6 Achsen: Base, Schulter, Ellenbogen, Drehen, Kippen, Greifen
-static const int SERVO_COUNT = 6;
-static const char* SERVO_NAME[SERVO_COUNT] = {
-  "Base", "Schulter", "Ellenbogen", "Drehen", "Kippen", "Greifen"
-};
-
-// PCA-Kanäle 0..5
-static const uint8_t SERVO_CH[SERVO_COUNT] = {0,1,2,3,4,5};
-
-Preferences prefs;
+// ====== Web ======
 WebServer server(80);
 
-// gespeicherte Home-Positionen (Grad)
-int homeDeg[SERVO_COUNT] = {90,90,90,90,90,90};
-int curDeg[SERVO_COUNT]  = {90,90,90,90,90,90};
+// ====== LEDs ======
+Adafruit_NeoPixel ring(LEDS_RING, PIN_RING, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel cab(LEDS_CABINET, PIN_CABINET, NEO_GRB + NEO_KHZ800);
 
-static uint16_t usToPcaTicks(uint16_t microseconds) {
-  // PCA9685 hat 4096 steps pro Periode
-  // Periodendauer bei 50Hz = 20ms = 20000us
-  // ticks = us * 4096 / 20000
-  const uint32_t ticks = (uint32_t)microseconds * 4096UL / 20000UL;
-  return (uint16_t)ticks;
-}
+// ====== State ======
+enum StatusMode : uint8_t { IDLE=0, ENABLED=1, AUTO=2, FAULT=3, ESTOP=4 };
+StatusMode statusMode = IDLE;
 
-static uint16_t degToUs(int deg) {
-  if (deg < 0) deg = 0;
-  if (deg > 180) deg = 180;
-  const uint32_t us = PULSE_MIN_US + (uint32_t)(PULSE_MAX_US - PULSE_MIN_US) * (uint32_t)deg / 180UL;
-  return (uint16_t)us;
-}
+uint8_t cabBrightness = 80; // 0..255 (Software-Dimmung)
+bool cabOn = true;
 
-static void setServoDeg(int idx, int deg) {
-  if (idx < 0 || idx >= SERVO_COUNT) return;
-  if (deg < 0) deg = 0;
-  if (deg > 180) deg = 180;
-
-  curDeg[idx] = deg;
-  uint16_t us = degToUs(deg);
-  uint16_t ticks = usToPcaTicks(us);
-
-  // setPWM(channel, on, off)
-  pca.setPWM(SERVO_CH[idx], 0, ticks);
-}
-
-static void loadHomes() {
-  prefs.begin("robotarm", true);
-  for (int i=0;i<SERVO_COUNT;i++) {
-    String key = String("h") + i;
-    homeDeg[i] = prefs.getInt(key.c_str(), 90);
-    curDeg[i] = homeDeg[i];
+// ====== Helpers ======
+uint32_t colorForMode(StatusMode m) {
+  switch (m) {
+    case IDLE:    return ring.Color(0, 0, 40);      // blau
+    case ENABLED: return ring.Color(0, 40, 0);      // grün
+    case AUTO:    return ring.Color(40, 20, 0);     // gelb/orange
+    case FAULT:   return ring.Color(40, 0, 0);      // rot
+    case ESTOP:   return ring.Color(80, 0, 0);      // rot hell
+    default:      return ring.Color(0, 0, 0);
   }
-  prefs.end();
 }
 
-static void saveHomes() {
-  prefs.begin("robotarm", false);
-  for (int i=0;i<SERVO_COUNT;i++) {
-    String key = String("h") + i;
-    prefs.putInt(key.c_str(), homeDeg[i]);
+void applyRing() {
+  uint32_t c = colorForMode(statusMode);
+  for (int i = 0; i < LEDS_RING; i++) ring.setPixelColor(i, c);
+  ring.show();
+}
+
+void applyCabinet() {
+  cab.setBrightness(cabOn ? cabBrightness : 0);
+  // nur weiß:
+  for (int i = 0; i < LEDS_CABINET; i++) cab.setPixelColor(i, cab.Color(255, 255, 255));
+  cab.show();
+}
+
+String modeName(StatusMode m) {
+  switch (m) {
+    case IDLE: return "IDLE";
+    case ENABLED: return "ENABLED";
+    case AUTO: return "AUTO";
+    case FAULT: return "FAULT";
+    case ESTOP: return "E-STOP";
+    default: return "?";
   }
-  prefs.end();
 }
 
-static String htmlPage() {
+// ====== Pages ======
+String htmlIndex() {
   String s;
-  s.reserve(6000);
-  s += "<!doctype html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
-  s += "<title>RobotArm Kalibrierung</title>";
-  s += "<style>body{font-family:Arial;margin:20px;background:#0b0b0b;color:#eaeaea}"
-       ".card{background:#161616;padding:14px;border-radius:12px;margin:10px 0}"
-       "input[type=range]{width:100%} .row{display:flex;gap:10px;align-items:center}"
-       "button{padding:10px 14px;border:0;border-radius:10px;margin:6px 6px 0 0}"
-       ".ok{background:#2e7d32;color:#fff} .warn{background:#b71c1c;color:#fff} a{color:#66aaff}"
-       "</style></head><body>";
-  s += "<h2>RobotArm Kalibrierung</h2>";
-  s += "<div class='card'><b>Web OTA:</b> <a href='/ota'>hier</a></div>";
+  s += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  s += "<title>RobotArm</title>";
+  s += "<style>body{font-family:Arial;margin:20px;background:#111;color:#eee}";
+  s += "a{color:#7cf} .card{background:#1b1b1b;padding:16px;border-radius:12px;margin-bottom:12px}";
+  s += "button{padding:12px 16px;margin:6px;border-radius:10px;border:0;background:#2b2b2b;color:#eee}";
+  s += "input[type=range]{width:100%}</style></head><body>";
 
-  for (int i=0;i<SERVO_COUNT;i++) {
-    s += "<div class='card'>";
-    s += "<div class='row'><b>";
-    s += SERVO_NAME[i];
-    s += "</b><span id='v";
-    s += i;
-    s += "'>";
-    s += String(curDeg[i]);
-    s += "</span>°</div>";
-    s += "<input type='range' min='0' max='180' value='";
-    s += String(curDeg[i]);
-    s += "' oninput='setS(";
-    s += i;
-    s += ", this.value)'>";
-    s += "<div class='row'>";
-    s += "<button class='ok' onclick='setHome(";
-    s += i;
-    s += ")'>Als HOME speichern</button>";
-    s += "</div></div>";
-  }
+  s += "<h2>RobotArm Control</h2>";
 
-  s += "<div class='card'>";
-  s += "<button class='ok' onclick='goHome()'>Alle auf HOME</button>";
-  s += "<button class='warn' onclick='saveAll()'>HOME Werte speichern</button>";
+  s += "<div class='card'><b>Status Ring:</b> " + modeName(statusMode) + "<br>";
+  s += "<button onclick=\"setMode(0)\">IDLE</button>";
+  s += "<button onclick=\"setMode(1)\">ENABLED</button>";
+  s += "<button onclick=\"setMode(2)\">AUTO</button>";
+  s += "<button onclick=\"setMode(3)\">FAULT</button>";
+  s += "<button onclick=\"setMode(4)\">E-STOP</button>";
   s += "</div>";
 
-  s += "<script>"
-       "async function setS(i,val){document.getElementById('v'+i).innerText=val;"
-       "await fetch(`/api/set?id=${i}&deg=${val}`);}"
-       "async function setHome(i){await fetch(`/api/sethome?id=${i}`);}"
-       "async function goHome(){await fetch('/api/gohome'); location.reload();}"
-       "async function saveAll(){await fetch('/api/save'); alert('gespeichert');}"
-       "</script>";
+  s += "<div class='card'><b>Schaltschrank Licht (WS2812 wei&szlig;):</b><br>";
+  s += "An/Aus: <button onclick=\"cabToggle()\">" + String(cabOn ? "AUS" : "AN") + "</button><br><br>";
+  s += "Helligkeit: <span id='bval'>" + String(cabBrightness) + "</span>";
+  s += "<input type='range' min='0' max='255' value='" + String(cabBrightness) + "' oninput='setBright(this.value)'>";
+  s += "</div>";
+
+  s += "<div class='card'><b>Web OTA:</b> <a href='/update'>Firmware hochladen</a></div>";
+
+  s += "<script>";
+  s += "function req(u){fetch(u).then(()=>location.reload());}";
+  s += "function setMode(m){req('/set?mode='+m);}";
+  s += "function cabToggle(){req('/cab?toggle=1');}";
+  s += "function setBright(v){document.getElementById('bval').innerText=v; fetch('/cab?b='+v);}";
+  s += "</script>";
 
   s += "</body></html>";
   return s;
 }
 
-// --- OTA page ---
-static String otaPage() {
-  return String(
-    "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>OTA Update</title>"
-    "<style>body{font-family:Arial;margin:20px;background:#0b0b0b;color:#eaeaea}"
-    ".card{background:#161616;padding:14px;border-radius:12px;margin:10px 0}"
-    "button{padding:10px 14px;border:0;border-radius:10px;background:#2e7d32;color:#fff}"
-    "a{color:#66aaff}</style></head><body>"
-    "<h2>Web OTA</h2>"
-    "<div class='card'>Firmware .bin auswählen und hochladen. Danach reboot.</div>"
-    "<form method='POST' action='/update' enctype='multipart/form-data'>"
-    "<input type='file' name='update' accept='.bin' required>"
-    "<button type='submit'>Upload</button>"
-    "</form>"
-    "<div class='card'><a href='/'>zurück</a></div>"
-    "</body></html>"
-  );
+String htmlUpdate() {
+  String s;
+  s += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  s += "<title>OTA Update</title><style>body{font-family:Arial;margin:20px}</style></head><body>";
+  s += "<h2>Firmware Update (Web OTA)</h2>";
+  s += "<form method='POST' action='/update' enctype='multipart/form-data'>";
+  s += "<input type='file' name='update' accept='.bin' required>";
+  s += "<input type='submit' value='Upload'>";
+  s += "</form>";
+  s += "<p><a href='/'>Zur&uuml;ck</a></p>";
+  s += "</body></html>";
+  return s;
 }
 
+// ====== Handlers ======
+void handleRoot() {
+  server.send(200, "text/html", htmlIndex());
+}
+
+void handleSet() {
+  if (server.hasArg("mode")) {
+    int m = server.arg("mode").toInt();
+    if (m >= 0 && m <= 4) {
+      statusMode = (StatusMode)m;
+      applyRing();
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleCab() {
+  if (server.hasArg("toggle")) {
+    cabOn = !cabOn;
+    applyCabinet();
+  }
+  if (server.hasArg("b")) {
+    int b = server.arg("b").toInt();
+    if (b < 0) b = 0;
+    if (b > 255) b = 255;
+    cabBrightness = (uint8_t)b;
+    applyCabinet();
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleUpdateGet() {
+  server.send(200, "text/html", htmlUpdate());
+}
+
+void handleUpdatePost() {
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK - Rebooting");
+  delay(500);
+  ESP.restart();
+}
+
+void handleUpdateUpload() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    // Serial.printf("Update: %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      // Serial.println("Update.begin failed");
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      // Serial.println("Update.write failed");
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (!Update.end(true)) {
+      // Serial.printf("Update.end failed: %s\n", Update.errorString());
+    }
+  }
+}
+
+// ====== Setup / Loop ======
 void setup() {
-  Serial.begin(115200);
-  delay(200);
+  // Serial.begin(115200);
 
-  // I2C + PCA
-  Wire.begin(); // ESP32 default SDA=21 SCL=22
-  pca.begin();
-  pca.setOscillatorFrequency(27000000);
-  pca.setPWMFreq(SERVO_FREQ);
+  // I2C vorbereiten (PCA9685 später)
+  Wire.begin(I2C_SDA, I2C_SCL);
 
-  loadHomes();
-  for (int i=0;i<SERVO_COUNT;i++) setServoDeg(i, curDeg[i]);
+  // LEDs init
+  ring.begin();
+  ring.setBrightness(120); // Ring-Helligkeit fix (kannst du später auch per Web machen)
+  ring.show();
+
+  cab.begin();
+  cab.setBrightness(cabBrightness);
+  cab.show();
+
+  // Startwerte
+  applyRing();
+  applyCabinet();
 
   // WiFi AP
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
-  delay(200);
 
   // Routes
-  server.on("/", HTTP_GET, [](){ server.send(200, "text/html", htmlPage()); });
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/set", HTTP_GET, handleSet);
+  server.on("/cab", HTTP_GET, handleCab);
 
-  server.on("/api/set", HTTP_GET, [](){
-    if (!server.hasArg("id") || !server.hasArg("deg")) { server.send(400, "text/plain", "bad args"); return; }
-    int id  = server.arg("id").toInt();
-    int deg = server.arg("deg").toInt();
-    setServoDeg(id, deg);
-    server.send(200, "text/plain", "ok");
-  });
-
-  server.on("/api/sethome", HTTP_GET, [](){
-    if (!server.hasArg("id")) { server.send(400, "text/plain", "bad args"); return; }
-    int id = server.arg("id").toInt();
-    if (id < 0 || id >= SERVO_COUNT) { server.send(400, "text/plain", "bad id"); return; }
-    homeDeg[id] = curDeg[id];
-    server.send(200, "text/plain", "ok");
-  });
-
-  server.on("/api/gohome", HTTP_GET, [](){
-    for (int i=0;i<SERVO_COUNT;i++) setServoDeg(i, homeDeg[i]);
-    server.send(200, "text/plain", "ok");
-  });
-
-  server.on("/api/save", HTTP_GET, [](){
-    saveHomes();
-    server.send(200, "text/plain", "ok");
-  });
-
-  // OTA endpoints
-  server.on("/ota", HTTP_GET, [](){ server.send(200, "text/html", otaPage()); });
-
-  server.on("/update", HTTP_POST,
-    []() {
-      // finished
-      server.sendHeader("Connection", "close");
-      server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK - reboot");
-      delay(200);
-      ESP.restart();
-    },
-    []() {
-      HTTPUpload& upload = server.upload();
-      if (upload.status == UPLOAD_FILE_START) {
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-          Update.printError(Serial);
-        }
-      } else if (upload.status == UPLOAD_FILE_WRITE) {
-        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-          Update.printError(Serial);
-        }
-      } else if (upload.status == UPLOAD_FILE_END) {
-        if (!Update.end(true)) {
-          Update.printError(Serial);
-        }
-      }
-    }
-  );
+  // OTA
+  server.on("/update", HTTP_GET, handleUpdateGet);
+  server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload);
 
   server.begin();
-
-  Serial.println("AP ready:");
-  Serial.print("SSID: "); Serial.println(AP_SSID);
-  Serial.print("IP:   "); Serial.println(WiFi.softAPIP());
 }
 
 void loop() {
