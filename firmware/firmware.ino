@@ -6,50 +6,71 @@
 #include <Adafruit_PWMServoDriver.h>
 
 /* ---------------- PINS / HW ---------------- */
-#define AMP_PIN     16      // Ampel WS2812B data
-#define CAB_PIN     17      // Schaltschranklicht WS2812B data
+#define AMP_PIN     16      // Ampel WS2812B data (4 LEDs)
+#define CAB_PIN     17      // Schaltschranklicht WS2812B data (10 LEDs)
 #define AMP_LEDS    4
 #define CAB_LEDS    10
 
 #define I2C_SDA     21
 #define I2C_SCL     22
 
-#define ONBOARD_LED 2       // viele ESP32 Devboards: GPIO2. Falls bei dir anders -> ändern.
+#define ONBOARD_LED 2       // bei vielen ESP32 Devboards GPIO2. Wenn bei dir anders: ändern.
 
 #define PCA_ADDR    0x40
 #define SERVO_FREQ  50
 
 /* ---------------- SERVOS (PCA9685 Kanäle) ---------------- */
 // Reihenfolge wie in deinem UI: Base, Schulter, Ellenbogen, Drehen, Kippen, Greifen
-static const uint8_t SERVO_CH[6] = {0, 1, 2, 3, 4, 5};
-static const char* SERVO_NAME[6] = {"Base","Schulter","Ellenbogen","Drehen","Kippen","Greifen"};
+static const uint8_t SERVO_CH[6]   = {0, 1, 2, 3, 4, 5};
+static const char*   SERVO_NAME[6] = {"Base","Schulter","Ellenbogen","Drehen","Kippen","Greifen"};
 
-// Pulsbreiten (typisch). Wenn bei dir knallt: anpassen.
-static const uint16_t SERVO_MIN = 110;  // ~0°
-static const uint16_t SERVO_MAX = 510;  // ~180°
+// Pulsbreiten (typisch). Wenn bei dir zu viel/zu wenig Weg: anpassen.
+static const uint16_t SERVO_MIN_PULSE = 110;  // ~0°
+static const uint16_t SERVO_MAX_PULSE = 510;  // ~180°
+
+/* Achs-Limits (Grad). Stell die realistisch ein, sonst knallt's mechanisch. */
+int servoMinDeg[6] = {  0,  0,  0,  0,  0,  0};
+int servoMaxDeg[6] = {180,180,180,180,180,180};
+
+/* Home-Positionen (Grad) */
+int servoHomeDeg[6] = {90, 90, 90, 90, 90, 90};
+
+/* Rampe */
+float rampDegPerSec[6] = {90, 90, 90, 120, 120, 140}; // pro Achse, anpassen
+const uint16_t SERVO_UPDATE_MS = 20;                   // 50 Hz
+
+/* Home Toleranz */
+const int HOME_TOL_DEG = 2;
 
 /* ---------------- LEDS ---------------- */
 CRGB ampLeds[AMP_LEDS];
 CRGB cabLeds[CAB_LEDS];
 
+CLEDController* ampCtl = nullptr;
+CLEDController* cabCtl = nullptr;
+
 /* ---------------- PCA ---------------- */
 Adafruit_PWMServoDriver pca(PCA_ADDR);
 
 /* ---------------- STATE ---------------- */
-enum State : uint8_t { STATE_WAIT, STATE_HOME, STATE_RUN, STATE_STOP, STATE_FAULT };
-State currentState = STATE_WAIT;
-State stateBeforeFault = STATE_WAIT;
+enum SafetyState : uint8_t { SAFETY_NORMAL, SAFETY_STOP, SAFETY_FAULT };
+SafetyState safetyState = SAFETY_STOP;  // nach Boot gehen wir auf STOP/rot (konsequent)
 
-uint8_t ampBrightness = 120;     // 0..255
-uint8_t cabBrightness = 80;      // 0..255
+uint8_t ampBrightness = 120; // 0..255
+uint8_t cabBrightness = 80;  // 0..255
 
 bool faultBlink = false;
-uint32_t blinkT = 0;
+uint32_t faultBlinkT = 0;
 
-/* Servo positions in degrees */
-int servoDeg[6]     = {90, 90, 90, 90, 90, 90};
-int servoHomeDeg[6] = {90, 90, 90, 90, 90, 90};
-bool servosEnabled = true; // für Test: wir lassen enabled, aber du kannst später darüber "Freigabe" bauen
+/* Servo Motion */
+struct AxisMotion {
+  float curDeg = 90.0f;
+  float tgtDeg = 90.0f;
+  bool  moving = false;
+};
+AxisMotion axis[6];
+
+uint32_t lastServoUpdate = 0;
 
 /* ---------------- WIFI / WEB ---------------- */
 WebServer server(80);
@@ -57,46 +78,50 @@ const char* AP_SSID = "RobotCtrl";
 const char* AP_PASS = "12345678";
 
 /* ---------------- UTILS ---------------- */
-static inline uint16_t degToPwm(int deg) {
-  if (deg < 0) deg = 0;
-  if (deg > 180) deg = 180;
-  // linear map
-  return (uint16_t)(SERVO_MIN + ( (SERVO_MAX - SERVO_MIN) * (float)deg / 180.0f ));
+static inline int clampi(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
 }
 
-void writeServo(uint8_t idx, int deg) {
-  servoDeg[idx] = deg;
-  if (!servosEnabled) return;
+static inline uint16_t degToPwm(float deg) {
+  if (deg < 0) deg = 0;
+  if (deg > 180) deg = 180;
+  const float span = (float)(SERVO_MAX_PULSE - SERVO_MIN_PULSE);
+  return (uint16_t)(SERVO_MIN_PULSE + (span * (deg / 180.0f)));
+}
+
+void writeServoNow(uint8_t idx, float deg) {
   uint16_t pwm = degToPwm(deg);
   pca.setPWM(SERVO_CH[idx], 0, pwm);
 }
 
-void moveAllHome() {
-  for (int i=0;i<6;i++) writeServo(i, servoHomeDeg[i]);
+bool anyAxisMoving() {
+  for (int i=0;i<6;i++) if (axis[i].moving) return true;
+  return false;
 }
 
-CRGB scaleColor(CRGB c, uint8_t b) {
+bool atHome() {
+  for (int i=0;i<6;i++) {
+    if (abs((int)round(axis[i].curDeg) - servoHomeDeg[i]) > HOME_TOL_DEG) return false;
+  }
+  return true;
+}
+
+/* ---------------- LED HELPERS ---------------- */
+static inline CRGB scaleColor(CRGB c, uint8_t b) {
   c.nscale8_video(b);
   return c;
 }
 
-/* ---------------- LED LOGIC ---------------- */
-void setAmpelSolid(CRGB color) {
-  CRGB c = scaleColor(color, ampBrightness);
-
-  // gewünschte Reihenfolge (deine Vorgabe):
-  // LED1 blau, LED2 grün, LED3 gelb, LED4 rot
-  // => Wir zeigen IMMER nur die passende LED, nicht alle.
-  // HOME=blau => LED0 an
-  // RUN=grün  => LED1 an
-  // WAIT=gelb => LED2 an
-  // STOP=rot  => LED3 an
+void setAmpelOneOf4(CRGB color) {
+  // LED1 (index0) blau, LED2 (index1) grün, LED3 (index2) gelb, LED4 (index3) rot
   for (int i=0;i<AMP_LEDS;i++) ampLeds[i] = CRGB::Black;
 
-  if (color == CRGB::Blue)   ampLeds[0] = c;
-  if (color == CRGB::Green)  ampLeds[1] = c;
-  if (color == CRGB::Yellow) ampLeds[2] = c;
-  if (color == CRGB::Red)    ampLeds[3] = c;
+  if (color == CRGB::Blue)   ampLeds[0] = scaleColor(CRGB::Blue,   ampBrightness);
+  if (color == CRGB::Green)  ampLeds[1] = scaleColor(CRGB::Green,  ampBrightness);
+  if (color == CRGB::Yellow) ampLeds[2] = scaleColor(CRGB::Yellow, ampBrightness);
+  if (color == CRGB::Red)    ampLeds[3] = scaleColor(CRGB::Red,    ampBrightness);
 }
 
 void updateCabinet() {
@@ -104,57 +129,144 @@ void updateCabinet() {
   for (int i=0;i<CAB_LEDS;i++) cabLeds[i] = w;
 }
 
-void updateOnboard() {
-  // “rot” geht bei Onboard nicht – ist nur an/aus.
-  // Vorgabe: immer an solange normal; bei Fault blinkt.
-  if (currentState == STATE_FAULT) {
-    digitalWrite(ONBOARD_LED, (millis()/250)%2 ? HIGH : LOW);
+void updateOnboardLED() {
+  if (safetyState == SAFETY_FAULT) {
+    digitalWrite(ONBOARD_LED, ((millis()/250)%2) ? HIGH : LOW);
   } else {
-    digitalWrite(ONBOARD_LED, HIGH);
+    digitalWrite(ONBOARD_LED, HIGH); // immer an, solange ESP läuft
   }
 }
 
 void updateLeds() {
-  if (currentState == STATE_FAULT) {
-    if (millis() - blinkT > 300) {
-      blinkT = millis();
+  if (safetyState == SAFETY_FAULT) {
+    if (millis() - faultBlinkT > 300) {
+      faultBlinkT = millis();
       faultBlink = !faultBlink;
     }
-    // Fault: ROT blinkend auf LED4 (Index 3)
     for (int i=0;i<AMP_LEDS;i++) ampLeds[i] = CRGB::Black;
-    if (faultBlink) ampLeds[3] = scaleColor(CRGB::Red, ampBrightness);
+    if (faultBlink) ampLeds[3] = scaleColor(CRGB::Red, ampBrightness); // rot blink
+  } else if (safetyState == SAFETY_STOP) {
+    setAmpelOneOf4(CRGB::Red); // STOP = rot dauerhaft
   } else {
-    switch(currentState) {
-      case STATE_WAIT: setAmpelSolid(CRGB::Yellow); break;
-      case STATE_HOME: setAmpelSolid(CRGB::Blue);   break;
-      case STATE_RUN:  setAmpelSolid(CRGB::Green);  break;
-      case STATE_STOP: setAmpelSolid(CRGB::Red);    break;
-      default: break;
+    // SAFETY_NORMAL: Anzeige abhängig von Aktivität / Home
+    if (anyAxisMoving()) {
+      setAmpelOneOf4(CRGB::Green); // RUN (nur während Bewegung)
+    } else if (atHome()) {
+      setAmpelOneOf4(CRGB::Blue);  // HOME
+    } else {
+      setAmpelOneOf4(CRGB::Yellow);// WAIT (steht, nicht home)
     }
   }
 
   updateCabinet();
+
+  // pro-strip Helligkeit sauber getrennt:
+  if (ampCtl) ampCtl->setBrightness(255);
+  if (cabCtl) cabCtl->setBrightness(255);
+
   FastLED.show();
-  updateOnboard();
+  updateOnboardLED();
 }
 
-/* ---------------- STATE RULES ---------------- */
-bool requireReset() {
-  return currentState == STATE_FAULT;
-}
-
+/* ---------------- SAFETY / STATE RULES ---------------- */
 void setFault() {
-  if (currentState != STATE_FAULT) stateBeforeFault = currentState;
-  currentState = STATE_FAULT;
+  safetyState = SAFETY_FAULT;
+  // sofort Bewegungen stoppen (Targets bleiben, aber wir fahren nicht weiter)
+  for (int i=0;i<6;i++) axis[i].moving = false;
 }
 
-void resetFault() {
-  if (currentState == STATE_FAULT) {
-    currentState = stateBeforeFault; // genau wie du willst
+void resetFaultToStop() {
+  // deine Vorgabe: Reset endet IMMER in STOP
+  if (safetyState == SAFETY_FAULT) {
+    safetyState = SAFETY_STOP;
+    for (int i=0;i<6;i++) axis[i].moving = false;
+  }
+}
+
+void setStop() {
+  if (safetyState != SAFETY_FAULT) {
+    safetyState = SAFETY_STOP;
+    for (int i=0;i<6;i++) axis[i].moving = false;
+  }
+}
+
+void setNormal() {
+  if (safetyState != SAFETY_FAULT) {
+    safetyState = SAFETY_NORMAL;
+  }
+}
+
+/* ---------------- MOTION ---------------- */
+void setTargetDeg(uint8_t i, int deg) {
+  deg = clampi(deg, servoMinDeg[i], servoMaxDeg[i]);
+  axis[i].tgtDeg = (float)deg;
+
+  // wenn wir normal sind: Bewegung freigeben
+  // wenn STOP: Ziel setzen ja, aber bewegen erst, wenn wieder NORMAL (Start/Home)
+  if (safetyState == SAFETY_NORMAL) {
+    axis[i].moving = (fabs(axis[i].tgtDeg - axis[i].curDeg) >= 0.5f);
+  }
+}
+
+void startMoveToTargets() {
+  // Start: wechselt STOP->NORMAL, und fährt alle Achsen, die nicht am Ziel sind.
+  setNormal();
+  for (int i=0;i<6;i++) {
+    axis[i].moving = (fabs(axis[i].tgtDeg - axis[i].curDeg) >= 0.5f);
+  }
+}
+
+void commandHome() {
+  if (safetyState == SAFETY_FAULT) return;
+  setNormal(); // Home darf fahren => normal
+  for (int i=0;i<6;i++) {
+    axis[i].tgtDeg = (float)clampi(servoHomeDeg[i], servoMinDeg[i], servoMaxDeg[i]);
+    axis[i].moving = (fabs(axis[i].tgtDeg - axis[i].curDeg) >= 0.5f);
+  }
+}
+
+void servoMotionLoop() {
+  if (safetyState == SAFETY_FAULT) return;  // nix bewegen
+  if (safetyState == SAFETY_STOP) return;   // nix bewegen
+
+  const uint32_t now = millis();
+  if (now - lastServoUpdate < SERVO_UPDATE_MS) return;
+  const float dt = (now - lastServoUpdate) / 1000.0f;
+  lastServoUpdate = now;
+
+  for (int i=0;i<6;i++) {
+    if (!axis[i].moving) continue;
+
+    float cur = axis[i].curDeg;
+    float tgt = axis[i].tgtDeg;
+    float maxStep = rampDegPerSec[i] * dt;
+
+    float diff = tgt - cur;
+    if (fabs(diff) <= maxStep) {
+      cur = tgt;
+      axis[i].moving = false;
+    } else {
+      cur += (diff > 0 ? maxStep : -maxStep);
+    }
+
+    // clamp final
+    cur = (float)clampi((int)round(cur), servoMinDeg[i], servoMaxDeg[i]);
+    axis[i].curDeg = cur;
+
+    writeServoNow((uint8_t)i, cur);
   }
 }
 
 /* ---------------- WEB UI ---------------- */
+String stateString() {
+  if (safetyState == SAFETY_FAULT) return "FAULT";
+  if (safetyState == SAFETY_STOP)  return "STOP";
+  // normal:
+  if (anyAxisMoving()) return "RUN";
+  if (atHome()) return "HOME";
+  return "WAIT";
+}
+
 String htmlPage() {
   String s;
   s += F(
@@ -173,12 +285,12 @@ String htmlPage() {
   "label{display:block;margin-top:10px}"
   "</style></head><body>"
   "<h2>RobotCtrl</h2>"
+
   "<div class='card'>"
   "<div><b>Status:</b> <span id='st'>...</span></div>"
-  "<button class='g' onclick=\"cmd('run')\">Start (RUN)</button>"
+  "<button class='g' onclick=\"cmd('start')\">Start</button>"
   "<button class='r' onclick=\"cmd('stop')\">Stop</button>"
   "<button class='b' onclick=\"cmd('home')\">Home</button>"
-  "<button class='y' onclick=\"cmd('wait')\">Wait</button>"
   "<button class='r' onclick=\"cmd('fault')\">FAULT</button>"
   "<button class='b' onclick=\"cmd('reset')\">Reset/Quit</button>"
   "</div>"
@@ -192,9 +304,10 @@ String htmlPage() {
   "</div>"
 
   "<div class='card'>"
-  "<h3>Servos</h3>"
+  "<h3>Servos (Targets)</h3>"
   "<div id='servos'></div>"
-  "<button class='b' onclick=\"goHome()\">HOME Position fahren</button>"
+  "<button class='w' onclick=\"cmd('apply')\">Apply / fahren (Start)</button>"
+  "<button class='b' onclick=\"cmd('home')\">HOME Position fahren</button>"
   "</div>"
 
   "<div class='card'>"
@@ -208,7 +321,7 @@ String htmlPage() {
   "<script>"
   "const names=['Base','Schulter','Ellenbogen','Drehen','Kippen','Greifen'];"
   "function qs(x){return document.querySelector(x)}"
-  "function cmd(s){fetch('/state?s='+s).then(r=>r.text()).then(t=>{poll();});}"
+  "function cmd(s){fetch('/cmd?c='+s).then(r=>r.text()).then(_=>poll());}"
   "function setB(){"
   "  const a=qs('#ab').value, c=qs('#cb').value;"
   "  qs('#abv').innerText=a; qs('#cbv').innerText=c;"
@@ -223,14 +336,13 @@ String htmlPage() {
   "  qs('#servos').innerHTML=h;"
   "}"
   "function setServo(i,v){qs('#sv'+i).innerText=v; fetch(`/servo?i=${i}&deg=${v}`);}"
-  "function goHome(){fetch('/home').then(_=>poll());}"
   "function poll(){fetch('/status').then(r=>r.json()).then(j=>{"
   "  qs('#st').innerText=j.state;"
   "  qs('#ab').value=j.ampB; qs('#cb').value=j.cabB;"
   "  qs('#abv').innerText=j.ampB; qs('#cbv').innerText=j.cabB;"
-  "  for(let i=0;i<6;i++){const e=qs('#sv'+i); if(e) e.innerText=j.servo[i];}"
+  "  for(let i=0;i<6;i++){const e=qs('#sv'+i); if(e) e.innerText=j.tgt[i];}"
   "});}"
-  "mkServos(); setB(); poll(); setInterval(poll,1000);"
+  "mkServos(); setB(); poll(); setInterval(poll,800);"
   "</script></body></html>"
   );
   return s;
@@ -241,47 +353,43 @@ void handleRoot() {
   server.send(200, "text/html", htmlPage());
 }
 
-const char* stateName(State s) {
-  switch(s) {
-    case STATE_WAIT: return "WAIT";
-    case STATE_HOME: return "HOME";
-    case STATE_RUN:  return "RUN";
-    case STATE_STOP: return "STOP";
-    case STATE_FAULT:return "FAULT";
-    default: return "?";
-  }
-}
-
 void handleStatus() {
   String json = "{";
-  json += "\"state\":\""; json += stateName(currentState); json += "\",";
+  json += "\"state\":\""; json += stateString(); json += "\",";
   json += "\"ampB\":"; json += ampBrightness; json += ",";
   json += "\"cabB\":"; json += cabBrightness; json += ",";
-  json += "\"servo\":[";
-  for (int i=0;i<6;i++) { json += servoDeg[i]; if (i<5) json += ","; }
+  json += "\"tgt\":[";
+  for (int i=0;i<6;i++) { json += (int)round(axis[i].tgtDeg); if (i<5) json += ","; }
   json += "]}";
   server.send(200, "application/json", json);
 }
 
-void handleState() {
-  if (!server.hasArg("s")) { server.send(400,"text/plain","Missing s"); return; }
-  String s = server.arg("s");
+void handleCmd() {
+  if (!server.hasArg("c")) { server.send(400,"text/plain","Missing c"); return; }
+  String c = server.arg("c");
 
-  // FAULT-Exit-Rule: ohne reset geht nix raus, auch nicht STOP
-  if (requireReset() && s != "reset") {
-    server.send(403, "text/plain", "Reset required");
+  // FAULT: nur reset erlaubt
+  if (safetyState == SAFETY_FAULT && c != "reset") {
+    server.send(403,"text/plain","Reset required");
     return;
   }
 
-  if (s == "fault") { setFault(); server.send(200,"text/plain","OK"); return; }
-  if (s == "reset") { resetFault(); server.send(200,"text/plain","OK"); return; }
+  if (c == "fault") { setFault(); server.send(200,"text/plain","OK"); return; }
+  if (c == "reset") { resetFaultToStop(); server.send(200,"text/plain","OK"); return; }
 
-  if (s == "wait") currentState = STATE_WAIT;
-  else if (s == "home") currentState = STATE_HOME;
-  else if (s == "run") currentState = STATE_RUN;
-  else if (s == "stop") currentState = STATE_STOP;
+  if (c == "stop")  { setStop(); server.send(200,"text/plain","OK"); return; }
 
-  server.send(200,"text/plain","OK");
+  if (c == "start" || c == "apply") {
+    startMoveToTargets(); // STOP->NORMAL, fährt auf Targets
+    server.send(200,"text/plain","OK"); return;
+  }
+
+  if (c == "home") {
+    commandHome();
+    server.send(200,"text/plain","OK"); return;
+  }
+
+  server.send(400,"text/plain","Unknown cmd");
 }
 
 void handleBrightness() {
@@ -297,18 +405,10 @@ void handleServo() {
   if (i < 0 || i > 5) { server.send(400,"text/plain","Bad index"); return; }
 
   // in FAULT sperren wir alles
-  if (requireReset()) { server.send(403,"text/plain","Reset required"); return; }
+  if (safetyState == SAFETY_FAULT) { server.send(403,"text/plain","Reset required"); return; }
 
-  writeServo((uint8_t)i, d);
-  server.send(200,"text/plain","OK");
-}
-
-void handleHomeMove() {
-  // in FAULT sperren
-  if (requireReset()) { server.send(403,"text/plain","Reset required"); return; }
-
-  moveAllHome();
-  currentState = STATE_HOME;
+  // Ziel setzen (bewegt erst bei Start / Home / Normal)
+  setTargetDeg((uint8_t)i, d);
   server.send(200,"text/plain","OK");
 }
 
@@ -336,18 +436,24 @@ void setup() {
   digitalWrite(ONBOARD_LED, HIGH);
 
   // LEDs
-  FastLED.addLeds<WS2812B, AMP_PIN, GRB>(ampLeds, AMP_LEDS);
-  FastLED.addLeds<WS2812B, CAB_PIN, GRB>(cabLeds, CAB_LEDS);
-  FastLED.setBrightness(255); // wir skalieren pro-strip selbst
+  ampCtl = &FastLED.addLeds<WS2812B, AMP_PIN, GRB>(ampLeds, AMP_LEDS);
+  cabCtl = &FastLED.addLeds<WS2812B, CAB_PIN, GRB>(cabLeds, CAB_LEDS);
+  FastLED.setBrightness(255);
 
   // I2C + PCA
   Wire.begin(I2C_SDA, I2C_SCL);
   pca.begin();
   pca.setPWMFreq(SERVO_FREQ);
 
-  // initial servos to home
-  moveAllHome();
-  currentState = STATE_HOME;
+  // init axis (cur=tgt=home)
+  for (int i=0;i<6;i++) {
+    axis[i].curDeg = (float)servoHomeDeg[i];
+    axis[i].tgtDeg = (float)servoHomeDeg[i];
+    axis[i].moving = false;
+    writeServoNow((uint8_t)i, axis[i].curDeg);
+  }
+
+  lastServoUpdate = millis();
 
   // WiFi AP
   WiFi.mode(WIFI_AP);
@@ -356,17 +462,19 @@ void setup() {
   // Web routes
   server.on("/", handleRoot);
   server.on("/status", handleStatus);
-  server.on("/state", handleState);
+  server.on("/cmd", handleCmd);
   server.on("/brightness", handleBrightness);
   server.on("/servo", handleServo);
-  server.on("/home", handleHomeMove);
-
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
 
   server.begin();
+
+  // Startzustand: STOP (rot)
+  safetyState = SAFETY_STOP;
 }
 
 void loop() {
   server.handleClient();
+  servoMotionLoop();
   updateLeds();
 }
