@@ -34,7 +34,7 @@ jobs:
             --output-dir build \
             firmware/firmware.ino
 
-      - name: Upload artifact (BIN files)
+      - name: Upload firmware BIN
         uses: actions/upload-artifact@v4
         with:
           name: firmware-bin
