@@ -1,516 +1,466 @@
 /*
-  RobotArm Controller (ESP32)
-  - Web UI + Web OTA
-  - Status Ampel: 4x WS2812B on GPIO16
-      LED1 (index 0): BLUE  = HOME
-      LED2 (index 1): GREEN = RUN
-      LED3 (index 2): YELLOW= WAIT
-      LED4 (index 3): RED   = FAULT (blinking)
-  - Cabinet light: 10x WS2812B on GPIO17 (white, dimmable)
-  - Separate brightness sliders (ampel != cabinet)
-  - State machine rules:
-      * From FAULT you cannot go to STOP/RUN/HOME without QUIT/RESET
-      * QUIT clears FAULT and restores display:
-          - if it was HOME before fault -> show HOME
-          - else -> show WAIT (stopped)
-      * QUIT does NOT auto-run and does NOT auto-home
-  - Onboard LED:
-      * Always ON (solid) while powered
-      * In FAULT it blinks (instead of solid)
+  ESP32 RobotArm Controller (Web UI + Web OTA + PCA9685 + WS2812B)
+  - Ampel: 4x WS2812B an GPIO16 (Index: 0=Blau,1=Grün,2=Gelb,3=Rot) -> Gelb wird nicht benutzt
+  - Schaltschranklicht: 10x WS2812B an GPIO17 (weiß, PWM-dimmbar über Helligkeit)
+  - Status:
+      RUN  = Grün dauerhaft
+      HOME = Blau dauerhaft
+      WAIT/STOP = Rot dauerhaft   (gewünscht)
+      FAULT = Rot blinkend        (gewünscht)
+  - Onboard LED: dauerhaft AN solange Power; bei FAULT blinkt
 */
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
+#include <Wire.h>
+
+#include <Adafruit_PWMServoDriver.h>
 #include <FastLED.h>
-#include <Preferences.h>
 
-// ----------------------------- USER CONFIG -----------------------------
+// ------------------- WLAN -------------------
+static const char* WIFI_SSID = "RobotArm";
+static const char* WIFI_PASS = "12345678";
 
-// WiFi AP (immer verfügbar)
-static const char* AP_SSID = "RobotArm";
-static const char* AP_PASS = "12345678";  // min. 8 Zeichen
+// ------------------- Pins -------------------
+static const int PIN_AMPEL   = 16;   // 4x WS2812B
+static const int PIN_CABINET = 17;   // 10x WS2812B
 
-// WS2812 Pins
-#define PIN_AMPEL     16
-#define PIN_CABINET   17
+#ifndef LED_BUILTIN
+  #define LED_BUILTIN 2
+#endif
 
-// LED counts
-#define NUM_AMPEL     4
-#define NUM_CABINET   10
+// ------------------- LEDs -------------------
+static const int AMPEL_LEDS   = 4;
+static const int CABINET_LEDS = 10;
 
-// Onboard LED (Board abhängig)
-#define ONBOARD_LED_PIN 2
-// Manche Boards haben LED active-low. Falls deine LED genau andersrum ist: true setzen.
-#define ONBOARD_LED_ACTIVE_LOW false
+CRGB ampel[AMPEL_LEDS];
+CRGB cabinet[CABINET_LEDS];
 
-// Fault blink timing
-static const uint32_t FAULT_BLINK_MS = 350;
+uint8_t ampelBrightness   = 40;   // 0..255
+uint8_t cabinetBrightness = 80;   // 0..255
 
-// ----------------------------------------------------------------------
+// ------------------- PCA9685 / Servos -------------------
+Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver(0x40);
 
+// Standard 50Hz Servo: Pulsbreite ~500..2500us
+static const uint16_t SERVO_MIN_US = 500;
+static const uint16_t SERVO_MAX_US = 2500;
+static const uint16_t SERVO_FREQ   = 50;
+
+static const int SERVO_COUNT = 6;
+// PCA Channels
+static const uint8_t servoCh[SERVO_COUNT] = {0, 1, 2, 3, 4, 5}; // Base, Schulter, Ellenbogen, Drehen, Kippen, Greifen
+
+// Aktuelle Winkel
+int servoDeg[SERVO_COUNT] = {90, 90, 90, 90, 90, 90};
+
+// Home-Werte (kannst du später per "Save Home" speichern; hier default 90)
+int homeDeg[SERVO_COUNT]  = {90, 90, 90, 90, 90, 90};
+
+// Soft-Limits (vorerst 0..180, kannst du später enger machen)
+int minDeg[SERVO_COUNT]   = {0, 0, 0, 0, 0, 0};
+int maxDeg[SERVO_COUNT]   = {180, 180, 180, 180, 180, 180};
+
+// ------------------- Zustände -------------------
+enum State : uint8_t { ST_WAIT, ST_RUN, ST_HOME, ST_FAULT };
+State state = ST_WAIT;
+
+// Merker für “was war vor FAULT”
+State stateBeforeFault = ST_WAIT;
+
+// Key-Schalter Simulation (Web)
+enum Mode : uint8_t { MODE_OFF, MODE_AUTO, MODE_MANUAL };
+Mode keyMode = MODE_OFF; // 0=Aus, 1=Auto, 2=Manuell
+
+// ------------------- Web -------------------
 WebServer server(80);
-Preferences prefs;
 
-// FastLED: Wir nutzen RAW-Buffer + DISP-Buffer, damit wir pro Strip getrennt dimmen können.
-CRGB ampelRaw[NUM_AMPEL];
-CRGB cabinetRaw[NUM_CABINET];
-
-CRGB ampelDisp[NUM_AMPEL];
-CRGB cabinetDisp[NUM_CABINET];
-
-// getrennte Helligkeit 0..255
-uint8_t brightnessAmpel   = 80;
-uint8_t brightnessCabinet = 120;
-
-// Cabinet on/off
-bool cabinetEnabled = true;
-
-// Key switch (simuliert über Web UI)
-enum KeyMode : uint8_t { KEY_OFF = 0, KEY_AUTO = 1, KEY_MANUAL = 2 };
-KeyMode keyMode = KEY_OFF;
-
-// Robot state machine
-enum RobotState : uint8_t { ST_WAIT = 0, ST_HOME = 1, ST_RUN = 2, ST_FAULT = 3 };
-RobotState state = ST_WAIT;
-RobotState stateBeforeFault = ST_WAIT;
-
-// Fault flag (redundant aber praktisch)
-bool faultActive = false;
-
-// Blink toggle
+// ------------------- Timing -------------------
+unsigned long lastBlinkMs = 0;
 bool faultBlinkOn = false;
-uint32_t lastBlinkMs = 0;
 
-// ----------------------------------------------------------------------
-// Helpers
+// ------------------- Helpers -------------------
+static int clampi(int v, int lo, int hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
 
-static inline void onboardWrite(bool on) {
-  bool level = on;
-  if (ONBOARD_LED_ACTIVE_LOW) level = !level;
-  digitalWrite(ONBOARD_LED_PIN, level ? HIGH : LOW);
+static uint16_t usToPcaTicks(uint16_t us) {
+  // PCA9685 hat 4096 Ticks pro Periode
+  // Periode (us) = 1e6 / freq
+  const float period_us = 1000000.0f / (float)SERVO_FREQ;
+  const float ticks = (4096.0f * (float)us) / period_us;
+  return (uint16_t)clampi((int)(ticks + 0.5f), 0, 4095);
 }
 
-String stateToString(RobotState s) {
-  switch (s) {
-    case ST_WAIT:  return "WAIT";
-    case ST_HOME:  return "HOME";
-    case ST_RUN:   return "RUN";
-    case ST_FAULT: return "FAULT";
-  }
-  return "UNKNOWN";
+static void writeServoDeg(int idx, int deg) {
+  deg = clampi(deg, minDeg[idx], maxDeg[idx]);
+  servoDeg[idx] = deg;
+
+  const uint16_t us = (uint16_t)map(deg, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
+  const uint16_t ticks = usToPcaTicks(us);
+  pca.setPWM(servoCh[idx], 0, ticks);
 }
 
-String keyToString(KeyMode k) {
-  switch (k) {
-    case KEY_OFF:    return "OFF";
-    case KEY_AUTO:   return "AUTO";
-    case KEY_MANUAL: return "MANUAL";
-  }
-  return "UNKNOWN";
+static void applyAllServos() {
+  for (int i = 0; i < SERVO_COUNT; i++) writeServoDeg(i, servoDeg[i]);
 }
 
-// ----------------------------------------------------------------------
-// LED Rendering (separate brightness per strip)
-
-void clearAllRaw() {
-  fill_solid(ampelRaw, NUM_AMPEL, CRGB::Black);
-  fill_solid(cabinetRaw, NUM_CABINET, CRGB::Black);
+static void setAllCabinetWhite() {
+  for (int i = 0; i < CABINET_LEDS; i++) cabinet[i] = CRGB::White;
 }
 
-void renderAmpelRaw() {
-  fill_solid(ampelRaw, NUM_AMPEL, CRGB::Black);
+static void renderAmpel() {
+  // Alles aus
+  for (int i = 0; i < AMPEL_LEDS; i++) ampel[i] = CRGB::Black;
 
-  // Mapping wie gewünscht:
-  // index 0: BLUE  (HOME)
-  // index 1: GREEN (RUN)
-  // index 2: YELLOW(WAIT)
-  // index 3: RED   (FAULT blink)
+  // Index-Definition: 0=Blau,1=Grün,2=Gelb(ungenutzt),3=Rot
   if (state == ST_HOME) {
-    ampelRaw[0] = CRGB::Blue;
+    ampel[0] = CRGB::Blue;
   } else if (state == ST_RUN) {
-    ampelRaw[1] = CRGB::Green;
+    ampel[1] = CRGB::Green;
   } else if (state == ST_WAIT) {
-    ampelRaw[2] = CRGB::Yellow;
+    // WICHTIG: STOP/WAIT = ROT dauerhaft (dein Wunsch)
+    ampel[3] = CRGB::Red;
   } else if (state == ST_FAULT) {
-    ampelRaw[3] = faultBlinkOn ? CRGB::Red : CRGB::Black;
+    ampel[3] = faultBlinkOn ? CRGB::Red : CRGB::Black;
   }
 }
 
-void renderCabinetRaw() {
-  if (!cabinetEnabled) {
-    fill_solid(cabinetRaw, NUM_CABINET, CRGB::Black);
-    return;
-  }
-  fill_solid(cabinetRaw, NUM_CABINET, CRGB::White);
-}
+static void updateLeds() {
+  renderAmpel();
+  FastLED.setBrightness(ampelBrightness);
+  FastLED.show();
 
-void applyBrightnessAndShow() {
-  // copy RAW -> DISP and scale per strip
-  for (int i = 0; i < NUM_AMPEL; i++) {
-    ampelDisp[i] = ampelRaw[i];
-    ampelDisp[i].nscale8_video(brightnessAmpel);
-  }
-  for (int i = 0; i < NUM_CABINET; i++) {
-    cabinetDisp[i] = cabinetRaw[i];
-    cabinetDisp[i].nscale8_video(brightnessCabinet);
-  }
+  // Cabinet separat
+  setAllCabinetWhite();
+  FastLED[1].setBrightness(cabinetBrightness);
   FastLED.show();
 }
 
-void updateLedsNow() {
-  renderAmpelRaw();
-  renderCabinetRaw();
-  applyBrightnessAndShow();
+static void setState(State s) {
+  if (state == ST_FAULT && s != ST_FAULT) {
+    // FAULT darf nur über Reset/Quit verlassen werden -> wird im Handler erzwungen
+  }
+  state = s;
 }
 
-// ----------------------------------------------------------------------
-// State machine rules
-
-void enterFault(const String& reason) {
-  (void)reason; // optional log
-  if (state != ST_FAULT) stateBeforeFault = state;
-  state = ST_FAULT;
-  faultActive = true;
-  // Onboard LED will blink in loop
+static void enterFault() {
+  if (state != ST_FAULT) {
+    stateBeforeFault = state;
+    state = ST_FAULT;
+  }
 }
 
-void clearFault() {
-  // QUIT/RESET:
-  faultActive = false;
-  state = (stateBeforeFault == ST_HOME) ? ST_HOME : ST_WAIT;
+static void clearFaultViaReset() {
+  // Nach Quittierung NICHT automatisch Home/RUN erzwingen.
+  // Rücksprung:
+  // - Wenn vorher HOME -> HOME
+  // - Wenn vorher RUN -> WAIT (sicher)
+  // - Sonst -> vorheriger Zustand
+  if (stateBeforeFault == ST_RUN) state = ST_WAIT;
+  else state = stateBeforeFault;
 }
 
-bool canOperate() {
-  // Nicht starten wenn Key OFF
-  return keyMode != KEY_OFF;
-}
-
-void cmdStart() {
-  if (state == ST_FAULT) return;          // block
-  if (!canOperate()) return;              // key off => block
-  state = ST_RUN;
-}
-
-void cmdStop() {
-  if (state == ST_FAULT) return;          // block (Fault bleibt Fault)
-  state = ST_WAIT;
-}
-
-void cmdHome() {
-  if (state == ST_FAULT) return;          // block
-  // hier würdest du real die Servos auf HOME fahren
-  state = ST_HOME;
-}
-
-void cmdQuit() {
-  if (state != ST_FAULT) return;          // nur wenn Fault aktiv
-  clearFault();
-}
-
-// ----------------------------------------------------------------------
-// Persist settings
-
-void loadSettings() {
-  prefs.begin("robotarm", true);
-  brightnessAmpel   = prefs.getUChar("bAmpel", 80);
-  brightnessCabinet = prefs.getUChar("bCab", 120);
-  cabinetEnabled    = prefs.getBool("cabOn", true);
-  keyMode           = (KeyMode)prefs.getUChar("key", (uint8_t)KEY_OFF);
-  prefs.end();
-}
-
-void saveSettings() {
-  prefs.begin("robotarm", false);
-  prefs.putUChar("bAmpel", brightnessAmpel);
-  prefs.putUChar("bCab", brightnessCabinet);
-  prefs.putBool("cabOn", cabinetEnabled);
-  prefs.putUChar("key", (uint8_t)keyMode);
-  prefs.end();
-}
-
-// ----------------------------------------------------------------------
-// Web UI
-
-String htmlPage() {
+// ------------------- Web UI HTML -------------------
+static String htmlPage() {
   String s;
   s.reserve(6000);
 
-  s += F("<!doctype html><html><head><meta charset='utf-8'>"
-         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-         "<title>RobotArm</title>"
-         "<style>"
-         "body{font-family:system-ui,Arial;margin:16px;background:#0b0f14;color:#e8eef6;}"
-         ".card{background:#121a24;border:1px solid #1e2a3a;border-radius:14px;padding:14px;margin:12px 0;}"
-         "button{padding:12px 14px;border-radius:12px;border:1px solid #2a3b53;background:#1a2635;color:#e8eef6;"
-         "margin:6px 6px 6px 0;cursor:pointer;font-weight:600;}"
-         "button.red{background:#3b1a1a;border-color:#6a2a2a;}"
-         "button.green{background:#1a3b25;border-color:#2a6a3f;}"
-         "button.blue{background:#1a2a3b;border-color:#2a4a6a;}"
-         "button.yellow{background:#3b321a;border-color:#6a5a2a;}"
-         "input[type=range]{width:100%;}"
-         ".row{display:flex;gap:10px;flex-wrap:wrap;}"
-         ".pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#0f1620;border:1px solid #243447;}"
-         "a{color:#8bbcff;}"
-         "</style></head><body>");
+  s += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  s += "<title>RobotArm</title>";
+  s += "<style>body{font-family:Arial;background:#111;color:#eee;margin:16px}"
+       ".card{background:#1b1b1b;border-radius:12px;padding:14px;margin:12px 0}"
+       "button{padding:12px 14px;border:0;border-radius:10px;margin:6px;font-size:16px}"
+       ".g{background:#2e7d32;color:#fff}.r{background:#b71c1c;color:#fff}.b{background:#1565c0;color:#fff}.y{background:#f9a825;color:#000}.k{background:#333;color:#fff}"
+       "input[type=range]{width:100%}"
+       ".row{display:flex;gap:10px;flex-wrap:wrap}"
+       ".pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#333;margin-left:8px}"
+       "</style></head><body>";
 
-  s += F("<h2>RobotArm Controller</h2>");
+  s += "<h2>RobotArm Control <span class='pill' id='st'>...</span></h2>";
 
-  s += F("<div class='card'><div class='row'>");
-  s += F("<div class='pill'>State: <span id='st'>?</span></div>");
-  s += F("<div class='pill'>Key: <span id='key'>?</span></div>");
-  s += F("</div><div style='margin-top:10px;'>");
+  // Key mode
+  s += "<div class='card'><h3>Schluesselschalter (Simulation)</h3>";
+  s += "<div class='row'>";
+  s += "<button class='k' onclick=\"setMode('off')\">OFF</button>";
+  s += "<button class='b' onclick=\"setMode('auto')\">AUTO</button>";
+  s += "<button class='g' onclick=\"setMode('man')\">MANUAL</button>";
+  s += "</div></div>";
 
-  s += F("<button class='green' onclick=\"btn('start')\">START</button>");
-  s += F("<button class='red' onclick=\"btn('stop')\">STOP</button>");
-  s += F("<button class='blue' onclick=\"btn('home')\">HOME</button>");
-  s += F("<button class='yellow' onclick=\"btn('quit')\">RESET/QUIT</button>");
-  s += F("<button class='red' onclick=\"btn('fault')\">TRIGGER FAULT</button>");
+  // Controls
+  s += "<div class='card'><h3>Aktionen</h3>";
+  s += "<div class='row'>";
+  s += "<button class='g' onclick=\"cmd('start')\">Start</button>";
+  s += "<button class='r' onclick=\"cmd('stop')\">Stop</button>";
+  s += "<button class='b' onclick=\"cmd('home')\">Home fahren</button>";
+  s += "<button class='y' onclick=\"cmd('savehome')\">Home speichern</button>";
+  s += "<button class='b' onclick=\"cmd('reset')\">Reset / Quit</button>";
+  s += "<button class='r' onclick=\"cmd('fault')\">FAULT testen</button>";
+  s += "</div></div>";
 
-  s += F("</div></div>");
+  // Servo sliders
+  const char* names[SERVO_COUNT] = {"Base","Schulter","Ellenbogen","Drehen","Kippen","Greifen"};
+  s += "<div class='card'><h3>Servos (MANUAL)</h3>";
+  for (int i=0;i<SERVO_COUNT;i++) {
+    s += "<div style='margin:10px 0'><b>";
+    s += names[i];
+    s += ":</b> <span id='v";
+    s += i;
+    s += "'>90</span>&deg;";
+    s += "<input type='range' min='0' max='180' value='90' id='s";
+    s += i;
+    s += "' oninput=\"setServo(";
+    s += i;
+    s += ",this.value)\"></div>";
+  }
+  s += "</div>";
 
-  s += F("<div class='card'>"
-         "<h3>Key Switch (simuliert)</h3>"
-         "<div class='row'>"
-         "<button onclick=\"setKey(0)\">OFF</button>"
-         "<button onclick=\"setKey(1)\">AUTO</button>"
-         "<button onclick=\"setKey(2)\">MANUAL</button>"
-         "</div></div>");
+  // Brightness
+  s += "<div class='card'><h3>Helligkeit</h3>";
+  s += "<b>Ampel</b> <span id='ba'>0</span><input type='range' min='0' max='255' value='40' id='ra' oninput=\"setBright('ampel',this.value)\">";
+  s += "<b>Schaltschrank</b> <span id='bc'>0</span><input type='range' min='0' max='255' value='80' id='rc' oninput=\"setBright('cab',this.value)\">";
+  s += "</div>";
 
-  s += F("<div class='card'>"
-         "<h3>Helligkeit</h3>"
-         "<div>Ampel: <span id='ba'>?</span></div>"
-         "<input type='range' min='0' max='255' id='rAmpel' oninput='chgAmpel(this.value)'>"
-         "<div style='margin-top:10px;'>Schaltschrank: <span id='bc'>?</span></div>"
-         "<input type='range' min='0' max='255' id='rCab' oninput='chgCab(this.value)'>"
-         "<div style='margin-top:10px;'>"
-         "<button onclick=\"toggleCab()\">Cabinet On/Off</button>"
-         "</div>"
-         "</div>");
+  // OTA
+  s += "<div class='card'><h3>Web OTA</h3>";
+  s += "<form method='POST' action='/update' enctype='multipart/form-data'>";
+  s += "<input type='file' name='update' accept='.bin' required>";
+  s += "<button class='b' type='submit'>Upload .bin</button></form>";
+  s += "</div>";
 
-  s += F("<div class='card'>"
-         "<h3>Web OTA</h3>"
-         "<div><a href='/update'>Firmware hochladen</a></div>"
-         "</div>");
+  // Script
+  s += "<script>";
+  s += "async function j(u){return fetch(u).then(r=>r.json());}\n";
+  s += "async function cmd(c){await fetch('/cmd?c='+c);} \n";
+  s += "async function setMode(m){await fetch('/mode?m='+m);} \n";
+  s += "async function setServo(i,v){document.getElementById('v'+i).innerText=v; await fetch('/servo?i='+i+'&v='+v);} \n";
+  s += "async function setBright(w,v){ if(w==='ampel'){document.getElementById('ba').innerText=v;} else {document.getElementById('bc').innerText=v;} await fetch('/bright?w='+w+'&v='+v);} \n";
+  s += "async function poll(){let d=await j('/status'); document.getElementById('st').innerText=d.state+' / '+d.mode; ";
+  s += "for(let i=0;i<6;i++){let el=document.getElementById('s'+i); if(el){el.value=d.servo[i]; document.getElementById('v'+i).innerText=d.servo[i];}}";
+  s += "document.getElementById('ra').value=d.ampelB; document.getElementById('rc').value=d.cabB; document.getElementById('ba').innerText=d.ampelB; document.getElementById('bc').innerText=d.cabB;}\n";
+  s += "setInterval(poll,700); poll();";
+  s += "</script>";
 
-  s += F("<script>"
-         "async function refresh(){"
-         "  const r=await fetch('/api/status');"
-         "  const j=await r.json();"
-         "  document.getElementById('st').textContent=j.state;"
-         "  document.getElementById('key').textContent=j.key;"
-         "  document.getElementById('ba').textContent=j.bAmpel;"
-         "  document.getElementById('bc').textContent=j.bCab;"
-         "  document.getElementById('rAmpel').value=j.bAmpel;"
-         "  document.getElementById('rCab').value=j.bCab;"
-         "}"
-         "async function btn(name){await fetch('/api/button?name='+encodeURIComponent(name)); refresh();}"
-         "async function setKey(v){await fetch('/api/key?mode='+v); refresh();}"
-         "async function chgAmpel(v){await fetch('/api/brightness?ampel='+v);}"
-         "async function chgCab(v){await fetch('/api/brightness?cab='+v);}"
-         "async function toggleCab(){await fetch('/api/cabinet?toggle=1'); refresh();}"
-         "setInterval(refresh,800); refresh();"
-         "</script>");
-
-  s += F("</body></html>");
+  s += "</body></html>";
   return s;
 }
 
-void handleRoot() {
+// ------------------- Handlers -------------------
+static String stateToStr(State st) {
+  switch(st){
+    case ST_WAIT: return "STOP";
+    case ST_RUN:  return "RUN";
+    case ST_HOME: return "HOME";
+    case ST_FAULT:return "FAULT";
+  }
+  return "?";
+}
+static String modeToStr(Mode m) {
+  switch(m){
+    case MODE_OFF: return "OFF";
+    case MODE_AUTO:return "AUTO";
+    case MODE_MANUAL:return "MANUAL";
+  }
+  return "?";
+}
+
+static void handleRoot() {
   server.send(200, "text/html", htmlPage());
 }
 
-void handleStatus() {
+static void handleStatus() {
   String json = "{";
-  json += "\"state\":\"" + stateToString(state) + "\",";
-  json += "\"key\":\"" + keyToString(keyMode) + "\",";
-  json += "\"bAmpel\":" + String((int)brightnessAmpel) + ",";
-  json += "\"bCab\":" + String((int)brightnessCabinet) + ",";
-  json += "\"cabOn\":" + String(cabinetEnabled ? "true" : "false");
-  json += "}";
+  json += "\"state\":\"" + stateToStr(state) + "\",";
+  json += "\"mode\":\""  + modeToStr(keyMode) + "\",";
+  json += "\"ampelB\":" + String(ampelBrightness) + ",";
+  json += "\"cabB\":" + String(cabinetBrightness) + ",";
+  json += "\"servo\":[";
+  for (int i=0;i<SERVO_COUNT;i++){
+    json += String(servoDeg[i]);
+    if(i<SERVO_COUNT-1) json += ",";
+  }
+  json += "]}";
   server.send(200, "application/json", json);
 }
 
-void handleButton() {
-  if (!server.hasArg("name")) { server.send(400, "text/plain", "missing name"); return; }
-  String name = server.arg("name");
-
-  if (name == "fault") {
-    enterFault("manual");
-  } else if (name == "quit") {
-    cmdQuit();
-  } else if (name == "start") {
-    cmdStart();
-  } else if (name == "stop") {
-    cmdStop();
-  } else if (name == "home") {
-    cmdHome();
-  }
-
-  updateLedsNow();
-  server.send(200, "text/plain", "ok");
+static void handleMode() {
+  String m = server.arg("m");
+  if (m == "off") keyMode = MODE_OFF;
+  else if (m == "auto") keyMode = MODE_AUTO;
+  else if (m == "man") keyMode = MODE_MANUAL;
+  server.send(200, "text/plain", "OK");
 }
 
-void handleKey() {
-  if (!server.hasArg("mode")) { server.send(400, "text/plain", "missing mode"); return; }
-  int m = server.arg("mode").toInt();
-  if (m < 0) m = 0;
-  if (m > 2) m = 2;
-  keyMode = (KeyMode)m;
-  saveSettings();
-  updateLedsNow();
-  server.send(200, "text/plain", "ok");
+static void handleBright() {
+  String w = server.arg("w");
+  int v = server.arg("v").toInt();
+  v = clampi(v, 0, 255);
+  if (w == "ampel") ampelBrightness = (uint8_t)v;
+  else if (w == "cab") cabinetBrightness = (uint8_t)v;
+  server.send(200, "text/plain", "OK");
 }
 
-void handleBrightness() {
-  bool changed = false;
-
-  if (server.hasArg("ampel")) {
-    int v = server.arg("ampel").toInt();
-    if (v < 0) v = 0; if (v > 255) v = 255;
-    brightnessAmpel = (uint8_t)v;
-    changed = true;
+static void handleServo() {
+  // Servo nur in MANUAL (und nicht in FAULT)
+  if (keyMode != MODE_MANUAL || state == ST_FAULT) {
+    server.send(403, "text/plain", "MANUAL only / or FAULT");
+    return;
   }
-  if (server.hasArg("cab")) {
-    int v = server.arg("cab").toInt();
-    if (v < 0) v = 0; if (v > 255) v = 255;
-    brightnessCabinet = (uint8_t)v;
-    changed = true;
-  }
-
-  if (changed) {
-    saveSettings();
-    updateLedsNow();
-  }
-  server.send(200, "text/plain", "ok");
+  int i = server.arg("i").toInt();
+  int v = server.arg("v").toInt();
+  if (i < 0 || i >= SERVO_COUNT) { server.send(400, "text/plain", "bad idx"); return; }
+  writeServoDeg(i, v);
+  server.send(200, "text/plain", "OK");
 }
 
-void handleCabinet() {
-  if (server.hasArg("toggle")) {
-    cabinetEnabled = !cabinetEnabled;
-    saveSettings();
-    updateLedsNow();
+static void handleCmd() {
+  String c = server.arg("c");
+
+  // --- FAULT TEST ---
+  if (c == "fault") {
+    enterFault();
+    server.send(200, "text/plain", "OK");
+    return;
   }
-  server.send(200, "text/plain", "ok");
+
+  // --- RESET / QUIT ---
+  if (c == "reset") {
+    if (state == ST_FAULT) {
+      clearFaultViaReset();
+    }
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  // Ab hier: wenn FAULT -> blockieren (du wolltest: nicht von fault auf stop ohne quittieren)
+  if (state == ST_FAULT) {
+    server.send(403, "text/plain", "FAULT: need reset/quit");
+    return;
+  }
+
+  // --- START ---
+  if (c == "start") {
+    // Start nur wenn Key in AUTO oder MANUAL (dein späteres Safety-Setup kann das härter machen)
+    if (keyMode == MODE_OFF) { server.send(403, "text/plain", "Key OFF"); return; }
+    state = ST_RUN;
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  // --- STOP ---
+  if (c == "stop") {
+    // Soft-Stop: STOP/WAIT = rot dauerhaft
+    state = ST_WAIT;
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  // --- HOME FAHREN ---
+  if (c == "home") {
+    // Home fahren erlaubt wenn nicht OFF
+    if (keyMode == MODE_OFF) { server.send(403, "text/plain", "Key OFF"); return; }
+    for (int i=0;i<SERVO_COUNT;i++) writeServoDeg(i, homeDeg[i]);
+    state = ST_HOME;
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  // --- HOME SPEICHERN ---
+  if (c == "savehome") {
+    // Save nur in MANUAL
+    if (keyMode != MODE_MANUAL) { server.send(403, "text/plain", "MANUAL only"); return; }
+    for (int i=0;i<SERVO_COUNT;i++) homeDeg[i] = servoDeg[i];
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  server.send(400, "text/plain", "Unknown cmd");
 }
 
-// -------------------- Web OTA --------------------
-
-static const char* updateForm =
-"<!doctype html><html><head><meta charset='utf-8'>"
-"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>OTA Update</title>"
-"<style>body{font-family:system-ui;margin:16px;background:#0b0f14;color:#e8eef6}"
-"form{background:#121a24;border:1px solid #1e2a3a;border-radius:14px;padding:14px;max-width:520px}"
-"input,button{margin-top:10px;font-size:16px}"
-"button{padding:10px 14px;border-radius:12px;border:1px solid #2a3b53;background:#1a2635;color:#e8eef6;font-weight:700}"
-"</style></head><body>"
-"<h2>Firmware OTA Upload</h2>"
-"<form method='POST' action='/update' enctype='multipart/form-data'>"
-"<input type='file' name='update'>"
-"<button type='submit'>Upload</button>"
-"</form>"
-"<p><a href='/'>Zurück</a></p>"
-"</body></html>";
-
-void handleUpdatePage() {
-  server.send(200, "text/html", updateForm);
-}
-
-void handleUpdateUpload() {
+// OTA upload handler
+static void handleUpdate() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
-    // Stop everything that could disturb flashing
-    cmdStop();
-    updateLedsNow();
-
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-      // failed
-    }
+    Update.begin(UPDATE_SIZE_UNKNOWN);
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     Update.write(upload.buf, upload.currentSize);
   } else if (upload.status == UPLOAD_FILE_END) {
-    bool ok = Update.end(true);
-    server.send(200, "text/plain", ok ? "OK. Rebooting..." : "FAIL");
-    delay(600);
-    ESP.restart();
+    if (Update.end(true)) {
+      server.send(200, "text/plain", "OK. Rebooting...");
+      delay(300);
+      ESP.restart();
+    } else {
+      server.send(500, "text/plain", "Update failed");
+    }
   }
 }
 
-// ----------------------------------------------------------------------
-// Setup / Loop
-
-void setupWiFiAP() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
-}
-
-void setupWeb() {
+static void setupWeb() {
   server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/mode", handleMode);
+  server.on("/bright", handleBright);
+  server.on("/servo", handleServo);
+  server.on("/cmd", handleCmd);
 
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/button", HTTP_GET, handleButton);
-  server.on("/api/key", HTTP_GET, handleKey);
-  server.on("/api/brightness", HTTP_GET, handleBrightness);
-  server.on("/api/cabinet", HTTP_GET, handleCabinet);
-
-  server.on("/update", HTTP_GET, handleUpdatePage);
-  server.on("/update", HTTP_POST, []() {}, handleUpdateUpload);
+  server.on("/update", HTTP_POST,
+    [](){ server.send(200, "text/plain", ""); },
+    handleUpdate
+  );
 
   server.begin();
 }
 
-void setupFastLED() {
-  FastLED.addLeds<WS2812B, PIN_AMPEL, GRB>(ampelDisp, NUM_AMPEL);
-  FastLED.addLeds<WS2812B, PIN_CABINET, GRB>(cabinetDisp, NUM_CABINET);
-  FastLED.setBrightness(255); // wir skalieren selbst pro Strip
-  clearAllRaw();
-  updateLedsNow();
-}
-
-void setupOnboardLED() {
-  pinMode(ONBOARD_LED_PIN, OUTPUT);
-  // normal: dauerhaft an
-  onboardWrite(true);
-}
-
+// ------------------- Setup/Loop -------------------
 void setup() {
-  setupOnboardLED();
-  loadSettings();
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); // "ON" solange Power (bei FAULT blinken wir in loop)
 
-  setupFastLED();
-  setupWiFiAP();
+  Serial.begin(115200);
+  delay(200);
+
+  Wire.begin(21, 22);
+
+  // PCA init
+  pca.begin();
+  pca.setPWMFreq(SERVO_FREQ);
+  delay(10);
+  applyAllServos();
+
+  // FastLED: wir nutzen 2 Controller (Ampel + Cabinet)
+  FastLED.addLeds<WS2812B, PIN_AMPEL, GRB>(ampel, AMPEL_LEDS);
+  FastLED.addLeds<WS2812B, PIN_CABINET, GRB>(cabinet, CABINET_LEDS);
+
+  // WLAN AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(WIFI_SSID, WIFI_PASS);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
   setupWeb();
-
-  // Startzustand:
-  state = ST_WAIT;
-  stateBeforeFault = ST_WAIT;
-  faultActive = false;
-  updateLedsNow();
+  updateLeds();
 }
 
 void loop() {
   server.handleClient();
 
-  // Onboard LED behavior:
-  if (state == ST_FAULT) {
-    // blink
-    uint32_t now = millis();
-    if (now - lastBlinkMs >= FAULT_BLINK_MS) {
-      lastBlinkMs = now;
-      faultBlinkOn = !faultBlinkOn;
-      onboardWrite(faultBlinkOn);
-      updateLedsNow(); // Ampel red blink
-    }
-  } else {
-    // always solid ON
-    onboardWrite(true);
-    // also keep fault blink off
-    faultBlinkOn = false;
+  // Fault blink timing
+  unsigned long now = millis();
+  if (now - lastBlinkMs >= 350) {
+    lastBlinkMs = now;
+    faultBlinkOn = !faultBlinkOn;
   }
 
-  // If state is fault, keep ampel blinking even if no client refresh
+  // Onboard LED: immer an, außer bei FAULT -> blinkt
   if (state == ST_FAULT) {
-    // handled above
+    digitalWrite(LED_BUILTIN, faultBlinkOn ? HIGH : LOW);
+  } else {
+    digitalWrite(LED_BUILTIN, HIGH);
+  }
+
+  // LEDs aktualisieren (nicht zu oft, aber regelmäßig)
+  static unsigned long lastLedMs = 0;
+  if (now - lastLedMs > 100) {
+    lastLedMs = now;
+    updateLeds();
   }
 }
