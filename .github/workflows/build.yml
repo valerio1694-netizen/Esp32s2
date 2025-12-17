@@ -24,6 +24,7 @@ jobs:
       - name: Install libraries
         run: |
           arduino-cli lib update-index
+          arduino-cli lib install "LovyanGFX"
           arduino-cli lib install "FastLED"
           arduino-cli lib install "Adafruit PWM Servo Driver Library"
           arduino-cli lib install "Adafruit BusIO"
