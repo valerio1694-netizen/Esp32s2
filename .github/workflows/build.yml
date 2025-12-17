@@ -28,6 +28,9 @@ jobs:
           arduino-cli lib install "FastLED"
           arduino-cli lib install "Adafruit PWM Servo Driver Library"
           arduino-cli lib install "Adafruit BusIO"
+          arduino-cli lib install "AsyncElegantOTA"
+          arduino-cli lib install "AsyncTCP"
+          arduino-cli lib install "ESPAsyncWebServer"
 
       - name: Compile firmware (export binaries)
         run: |
