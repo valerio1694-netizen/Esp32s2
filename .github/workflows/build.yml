@@ -11,51 +11,30 @@ jobs:
 
       - name: Install Arduino CLI
         run: |
-          set -euxo pipefail
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
           sudo mv bin/arduino-cli /usr/local/bin/
-          arduino-cli version
-
-      - name: Configure Arduino CLI (fixed sketchbook in repo)
-        run: |
-          set -euxo pipefail
-          arduino-cli config init --overwrite
-          arduino-cli config set directories.user "$GITHUB_WORKSPACE/.arduino"
-          mkdir -p "$GITHUB_WORKSPACE/.arduino/libraries"
 
       - name: Install ESP32 core
         run: |
-          set -euxo pipefail
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
       - name: Install libraries
         run: |
-          set -euxo pipefail
           arduino-cli lib update-index
-          arduino-cli lib install FastLED
+          arduino-cli lib install "FastLED"
 
       - name: Compile firmware (export binaries)
         run: |
-          set -euxo pipefail
           mkdir -p build
           arduino-cli compile \
             --fqbn esp32:esp32:esp32 \
-            --libraries "$GITHUB_WORKSPACE/.arduino/libraries" \
             --export-binaries \
-            --output-dir "$GITHUB_WORKSPACE/build" \
+            --output-dir build \
             firmware/firmware.ino
 
-          echo "== build output =="
-          ls -lah "$GITHUB_WORKSPACE/build"
-          find "$GITHUB_WORKSPACE/build" -maxdepth 2 -type f -name "*.bin" -print
-
-      - name: Upload firmware binaries
+      - name: Upload firmware binaries (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-firmware-bin
-          path: |
-            build/*.bin
-            build/*.elf
-            build/*.map
-          if-no-files-found: error
+          name: esp32-firmware
+          path: build/*
