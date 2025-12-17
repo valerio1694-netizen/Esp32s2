@@ -1,329 +1,430 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
-#include <FastLED.h>
+#include <Adafruit_NeoPixel.h>
 
-/* ===================== CONFIG ===================== */
+// ======================= CONFIG =======================
 
-#define PIN_TOWER        16
-#define NUM_TOWER        4
+// WiFi AP
+static const char* AP_SSID = "RobotArm";
+static const char* AP_PASS = "12345678"; // min. 8 Zeichen
 
-#define PIN_CAB          17
-#define NUM_CAB          10
+// NeoPixel Pins
+#define PIN_AMPEL        16   // Ampel WS2812B (4 LEDs)
+#define PIN_CABINET      17   // Schaltschrank WS2812B (10 LEDs)
 
-#define PIN_ONBOARD_LED  2   // ESP32 DevKit onboard LED (meist GPIO2)
+// NeoPixel Counts
+#define NUM_AMPEL        4
+#define NUM_CABINET      10
 
-#define AP_SSID "RobotArm"
-#define AP_PASS "12345678"
+// Onboard LED (meist GPIO2; falls bei dir anders: hier aendern)
+#ifndef LED_BUILTIN
+  #define LED_BUILTIN 2
+#endif
 
-/* ===================== LED ===================== */
+// Keyswitch (3-Position): AUTO / OFF / MANUAL
+// Verdrahtung: jeweilige Stellung schliesst Kontakt gegen GND
+#define PIN_KEY_AUTO     25
+#define PIN_KEY_MANUAL   26
 
-CRGB towerLeds[NUM_TOWER];
-CRGB cabLeds[NUM_CAB];
+static inline bool keyAuto()   { return digitalRead(PIN_KEY_AUTO)   == LOW; }
+static inline bool keyManual() { return digitalRead(PIN_KEY_MANUAL) == LOW; }
 
-uint8_t towerBrightness = 120;
-uint8_t cabBrightness   = 120;
-bool cabOn = true;
+// ======================= STATE =======================
 
-/* ===================== STATE ===================== */
-
-enum RobotState {
-  STATE_HOME,
-  STATE_RUN,
-  STATE_WAIT,
-  STATE_ERROR
+enum State : uint8_t {
+  ST_WAIT = 0,   // Gelb: aus/warten
+  ST_HOME,       // Blau: in Home-Position
+  ST_RUN,        // Gruen: laeuft
+  ST_FAULT       // Rot: Stoerung
 };
 
-RobotState state = STATE_WAIT;
-bool faultLatched = false;
-bool softStop = true;
+volatile State state = ST_WAIT;
+State preFaultState = ST_WAIT;   // merkt den Zustand vor FAULT (wichtig fuer Quit-Verhalten)
+
+uint32_t lastBlinkMs = 0;
+bool blinkOn = false;
+
+uint8_t brightAmpel   = 40;   // 0..255
+uint8_t brightCabinet = 60;   // 0..255
+
+Adafruit_NeoPixel ampel(NUM_AMPEL, PIN_AMPEL, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel cabinet(NUM_CABINET, PIN_CABINET, NEO_GRB + NEO_KHZ800);
 
 WebServer server(80);
 
-/* ===================== WEB UI (HTML) ===================== */
+// ======================= COLORS =======================
 
-const char INDEX_HTML[] PROGMEM = R"HTML(
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>RobotArm Panel</title>
-  <style>
-    body{font-family:Arial,Helvetica,sans-serif;background:#0b0b0b;color:#eee;margin:0;padding:16px}
-    .card{background:#151515;border:1px solid #2a2a2a;border-radius:12px;padding:14px;margin-bottom:12px}
-    .row{display:flex;gap:10px;flex-wrap:wrap}
-    button{padding:12px 14px;border:0;border-radius:10px;font-weight:700;cursor:pointer}
-    .g{background:#19a44a;color:#fff}
-    .r{background:#c53535;color:#fff}
-    .b{background:#2d6cdf;color:#fff}
-    .y{background:#d3a11f;color:#111}
-    .k{background:#444;color:#fff}
-    input[type=range]{width:100%}
-    .label{opacity:.8;margin:6px 0}
-    .small{font-size:12px;opacity:.8}
-    a{color:#6aa6ff}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2 style="margin:0 0 10px 0">RobotArm</h2>
-    <div class="row">
-      <button class="g" onclick="call('/start')">START</button>
-      <button class="r" onclick="call('/stop')">STOP (soft)</button>
-      <button class="b" onclick="call('/home')">HOME</button>
-      <button class="b" onclick="call('/reset')">RESET / QUIT</button>
-      <button class="r" onclick="call('/fault')">FAULT (Test)</button>
-    </div>
-    <div class="small" style="margin-top:10px">
-      Web OTA: <a href="/ota">hier</a>
-    </div>
-  </div>
+uint32_t colGreen()  { return ampel.Color(0, 255, 0); }
+uint32_t colBlue()   { return ampel.Color(0, 0, 255); }
+uint32_t colYellow() { return ampel.Color(255, 140, 0); }
+uint32_t colRed()    { return ampel.Color(255, 0, 0); }
+uint32_t colOff()    { return ampel.Color(0, 0, 0); }
 
-  <div class="card">
-    <div class="label">Ampel Helligkeit (GPIO16)</div>
-    <input type="range" min="0" max="255" value="120" oninput="setTower(this.value)">
-  </div>
+// Ampel Belegung (vom Eingang aus):
+// LED0 = Blau, LED1 = Gruen, LED2 = Gelb, LED3 = Rot
+void setAmpel(State st) {
+  ampel.setBrightness(brightAmpel);
 
-  <div class="card">
-    <div class="label">Schaltschrank Licht (GPIO17)</div>
-    <div class="row" style="margin-bottom:10px">
-      <button class="k" onclick="call('/cabOn?on=1')">AN</button>
-      <button class="k" onclick="call('/cabOn?on=0')">AUS</button>
-    </div>
-    <div class="label">Helligkeit</div>
-    <input type="range" min="0" max="255" value="120" oninput="setCab(this.value)">
-  </div>
+  for (int i = 0; i < NUM_AMPEL; i++) ampel.setPixelColor(i, colOff());
 
-<script>
-  function call(path){
-    fetch(path).then(()=>{}).catch(()=>{});
+  switch (st) {
+    case ST_HOME:  ampel.setPixelColor(0, colBlue());   break;
+    case ST_RUN:   ampel.setPixelColor(1, colGreen());  break;
+    case ST_WAIT:  ampel.setPixelColor(2, colYellow()); break;
+    case ST_FAULT: ampel.setPixelColor(3, colRed());    break;
   }
-  function setTower(v){
-    fetch('/tower?b=' + v).then(()=>{}).catch(()=>{});
-  }
-  function setCab(v){
-    fetch('/cab?b=' + v).then(()=>{}).catch(()=>{});
-  }
-</script>
-</body>
-</html>
-)HTML";
 
-const char OTA_HTML[] PROGMEM = R"HTML(
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>OTA Update</title>
-  <style>
-    body{font-family:Arial;background:#0b0b0b;color:#eee;margin:0;padding:16px}
-    .card{background:#151515;border:1px solid #2a2a2a;border-radius:12px;padding:14px}
-    input,button{width:100%;padding:12px;margin-top:10px;border-radius:10px;border:0}
-    button{background:#2d6cdf;color:#fff;font-weight:700;cursor:pointer}
-    a{color:#6aa6ff}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2 style="margin-top:0">OTA Update</h2>
-    <form method="POST" action="/update" enctype="multipart/form-data">
-      <input type="file" name="update" required>
-      <button type="submit">Upload</button>
-    </form>
-    <p><a href="/">zurueck</a></p>
-  </div>
-</body>
-</html>
-)HTML";
+  ampel.show();
+}
 
-/* ===================== HELPERS ===================== */
+// Schaltschrank: weiss, dimmbar ueber Brightness
+void setCabinet(uint8_t b) {
+  brightCabinet = b;
+  cabinet.setBrightness(brightCabinet);
+  for (int i = 0; i < NUM_CABINET; i++) cabinet.setPixelColor(i, cabinet.Color(255, 255, 255));
+  cabinet.show();
+}
 
-void updateOnboardLED() {
-  static uint32_t last = 0;
-  static bool led = true;
-
-  if (!faultLatched && state != STATE_ERROR) {
-    digitalWrite(PIN_ONBOARD_LED, HIGH); // dauerhaft an wenn normal
+// Onboard LED: immer AN, ausser bei FAULT -> blink
+void updateOnboardLed() {
+  if (state != ST_FAULT) {
+    digitalWrite(LED_BUILTIN, HIGH);
     return;
   }
-
-  if (millis() - last > 250) {
-    last = millis();
-    led = !led;
-    digitalWrite(PIN_ONBOARD_LED, led ? HIGH : LOW); // blinken bei Stoerung
+  uint32_t now = millis();
+  if (now - lastBlinkMs >= 200) {
+    lastBlinkMs = now;
+    blinkOn = !blinkOn;
+    digitalWrite(LED_BUILTIN, blinkOn ? HIGH : LOW);
   }
 }
 
-void drawTower() {
-  fill_solid(towerLeds, NUM_TOWER, CRGB::Black);
-
-  // Reihenfolge vom Eingang: 1=Blau, 2=Gruen, 3=Gelb, 4=Rot
-  // index 0 = Blau, 1 = Gruen, 2 = Gelb, 3 = Rot
-  int idx = -1;
-  CRGB c = CRGB::Black;
-
-  if (state == STATE_HOME)  { idx = 0; c = CRGB(0,0,255); }
-  if (state == STATE_RUN)   { idx = 1; c = CRGB(0,255,0); }
-  if (state == STATE_WAIT)  { idx = 2; c = CRGB(255,180,0); }
-  if (state == STATE_ERROR) { idx = 3; c = CRGB(255,0,0); }
-
-  c.nscale8_video(towerBrightness);
-  if (idx >= 0) towerLeds[idx] = c;
-}
-
-void drawCabinet() {
-  if (!cabOn) {
-    fill_solid(cabLeds, NUM_CAB, CRGB::Black);
-    return;
+const char* stateName(State st) {
+  switch (st) {
+    case ST_WAIT:  return "WAIT";
+    case ST_HOME:  return "HOME";
+    case ST_RUN:   return "RUN";
+    case ST_FAULT: return "FAULT";
   }
-
-  CRGB w = CRGB::White;
-  w.nscale8_video(cabBrightness);
-  fill_solid(cabLeds, NUM_CAB, w);
+  return "UNKNOWN";
 }
 
-void render() {
-  drawTower();
-  drawCabinet();
-  FastLED.show();
+// ======================= KEYSWITCH =======================
+
+bool keyswitchOk() {
+  // beide aktiv = ungueltig
+  if (keyAuto() && keyManual()) return false;
+  return true;
 }
 
-/* ===================== WEB HANDLERS ===================== */
-
-void handleRoot() {
-  server.send_P(200, "text/html", INDEX_HTML);
+bool keyswitchAllowsRun() {
+  if (!keyswitchOk()) return false;
+  return (keyAuto() || keyManual());
 }
 
-void handleOTA() {
-  server.send_P(200, "text/html", OTA_HTML);
+void enterFault(const String& why) {
+  // Zustand vor Fault merken (nur wenn wir nicht schon Fault sind)
+  if (state != ST_FAULT) preFaultState = state;
+
+  state = ST_FAULT;
+  setAmpel(state);
+  Serial.print("FAULT: ");
+  Serial.println(why);
 }
 
-void handleStart() {
-  if (!faultLatched) {
-    softStop = false;
-    state = STATE_RUN;
-    render();
-  }
-  server.send(200, "text/plain", "OK");
+// ======================= JSON API =======================
+
+void sendJson() {
+  String mode = "OFF";
+  if (keyAuto() && !keyManual()) mode = "AUTO";
+  if (!keyAuto() && keyManual()) mode = "MANUAL";
+  if (keyAuto() && keyManual())  mode = "INVALID";
+
+  String json = "{";
+  json += "\"state\":\"" + String(stateName(state)) + "\",";
+  json += "\"preFault\":\"" + String(stateName(preFaultState)) + "\",";
+  json += "\"key\":\"" + mode + "\",";
+  json += "\"brightAmpel\":" + String(brightAmpel) + ",";
+  json += "\"brightCabinet\":" + String(brightCabinet);
+  json += "}";
+
+  server.send(200, "application/json", json);
 }
+
+// ======================= CONTROL HANDLERS =======================
 
 void handleStop() {
-  softStop = true;
-  state = STATE_WAIT;
-  render();
-  server.send(200, "text/plain", "OK");
-}
-
-void handleHome() {
-  if (!faultLatched) {
-    softStop = true;
-    state = STATE_HOME;
-    render();
+  // Stop darf FAULT NICHT verlassen
+  if (state == ST_FAULT) {
+    server.send(409, "text/plain", "Cannot leave FAULT. Use RESET/QUIT.");
+    return;
   }
+  state = ST_WAIT;
+  setAmpel(state);
   server.send(200, "text/plain", "OK");
 }
 
 void handleReset() {
-  // wichtig: nach Stoerung -> WAIT (gelb), nicht HOME
-  faultLatched = false;
-  softStop = true;
-  state = STATE_WAIT;
-  render();
+  // Reset/Quitt: FAULT -> Zustand wiederherstellen:
+  // war es vorher HOME -> HOME
+  // sonst -> WAIT
+  if (state == ST_FAULT) {
+    state = (preFaultState == ST_HOME) ? ST_HOME : ST_WAIT;
+    setAmpel(state);
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  // Reset aus anderen States -> WAIT (konservativ)
+  state = ST_WAIT;
+  setAmpel(state);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleHome() {
+  if (state == ST_FAULT) { server.send(409, "text/plain", "FAULT: reset first"); return; }
+  if (!keyswitchAllowsRun()) { server.send(403, "text/plain", "Keyswitch not enabled"); return; }
+
+  // hier wuerdest du real die Servos in Home fahren
+  state = ST_HOME;
+  setAmpel(state);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleStart() {
+  if (state == ST_FAULT) { server.send(409, "text/plain", "FAULT: reset first"); return; }
+  if (!keyswitchAllowsRun()) { server.send(403, "text/plain", "Keyswitch not enabled"); return; }
+
+  // optional: Start nur nach HOME erzwingen:
+  // if (state != ST_HOME) { server.send(409, "text/plain", "Go HOME first"); return; }
+
+  state = ST_RUN;
+  setAmpel(state);
   server.send(200, "text/plain", "OK");
 }
 
 void handleFault() {
-  faultLatched = true;
-  state = STATE_ERROR;
-  render();
+  enterFault("Forced via Web");
   server.send(200, "text/plain", "OK");
 }
 
-void handleTowerBrightness() {
-  if (server.hasArg("b")) {
-    int v = server.arg("b").toInt();
-    if (v < 0) v = 0;
-    if (v > 255) v = 255;
-    towerBrightness = (uint8_t)v;
-    render();
-  }
+void handleSetBrightAmpel() {
+  if (!server.hasArg("v")) { server.send(400, "text/plain", "Missing v"); return; }
+  int v = server.arg("v").toInt();
+  if (v < 0) v = 0;
+  if (v > 255) v = 255;
+  brightAmpel = (uint8_t)v;
+  setAmpel(state);
   server.send(200, "text/plain", "OK");
 }
 
-void handleCabBrightness() {
-  if (server.hasArg("b")) {
-    int v = server.arg("b").toInt();
-    if (v < 0) v = 0;
-    if (v > 255) v = 255;
-    cabBrightness = (uint8_t)v;
-    render();
-  }
+void handleSetBrightCabinet() {
+  if (!server.hasArg("v")) { server.send(400, "text/plain", "Missing v"); return; }
+  int v = server.arg("v").toInt();
+  if (v < 0) v = 0;
+  if (v > 255) v = 255;
+  setCabinet((uint8_t)v);
   server.send(200, "text/plain", "OK");
 }
 
-void handleCabOn() {
-  if (server.hasArg("on")) {
-    cabOn = (server.arg("on").toInt() != 0);
-    render();
-  }
-  server.send(200, "text/plain", "OK");
+// ======================= WEB UI =======================
+
+static const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RobotArm</title>
+  <style>
+    body{font-family:Arial;margin:18px;background:#111;color:#eee}
+    .card{background:#1b1b1b;border:1px solid #333;border-radius:12px;padding:14px;margin:10px 0}
+    button{padding:12px 14px;border-radius:10px;border:0;margin:6px;font-weight:700}
+    .row{display:flex;flex-wrap:wrap;gap:10px}
+    .b{background:#2b2b2b;color:#fff}
+    .g{background:#1f7a3a;color:#fff}
+    .r{background:#8a1f1f;color:#fff}
+    .y{background:#a07b12;color:#111}
+    .bl{background:#1f3f8a;color:#fff}
+    input[type=range]{width:100%}
+    code{color:#9ef}
+    a{color:#9ef}
+  </style>
+</head>
+<body>
+  <h2>RobotArm Control</h2>
+
+  <div class="card">
+    <div>Status: <code id="st">?</code> | Prev: <code id="pf">?</code> | Key: <code id="key">?</code></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button class="g" onclick="api('/api/start')">START</button>
+      <button class="y" onclick="api('/api/stop')">STOP</button>
+      <button class="bl" onclick="api('/api/home')">HOME</button>
+      <button class="r" onclick="api('/api/fault')">FORCE FAULT</button>
+      <button class="b" onclick="api('/api/reset')">RESET / QUIT</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div>Ampel Helligkeit: <span id="ba">?</span></div>
+    <input type="range" min="0" max="255" id="ra" oninput="setAmpel(this.value)">
+  </div>
+
+  <div class="card">
+    <div>Schaltschrank Licht: <span id="bc">?</span></div>
+    <input type="range" min="0" max="255" id="rc" oninput="setCab(this.value)">
+  </div>
+
+  <div class="card">
+    <a href="/ota">Web OTA</a>
+  </div>
+
+<script>
+async function refresh(){
+  const r = await fetch('/api/state');
+  const j = await r.json();
+  document.getElementById('st').textContent = j.state;
+  document.getElementById('pf').textContent = j.preFault;
+  document.getElementById('key').textContent = j.key;
+  document.getElementById('ba').textContent = j.brightAmpel;
+  document.getElementById('bc').textContent = j.brightCabinet;
+  document.getElementById('ra').value = j.brightAmpel;
+  document.getElementById('rc').value = j.brightCabinet;
 }
-
-/* ===================== OTA UPLOAD ===================== */
-
-void handleUpdateUpload() {
-  HTTPUpload& u = server.upload();
-  if (u.status == UPLOAD_FILE_START) {
-    Update.begin();
-  } else if (u.status == UPLOAD_FILE_WRITE) {
-    Update.write(u.buf, u.currentSize);
-  } else if (u.status == UPLOAD_FILE_END) {
-    Update.end(true);
-  }
+async function api(p){
+  const r = await fetch(p, {method:'POST'});
+  if(!r.ok){ alert(await r.text()); }
+  refresh();
 }
-
-void handleUpdateDone() {
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
-  delay(500);
-  ESP.restart();
+let t;
+async function setAmpel(v){
+  clearTimeout(t);
+  document.getElementById('ba').textContent = v;
+  t=setTimeout(()=>fetch('/api/bright/ampel?v='+v,{method:'POST'}),150);
 }
+let t2;
+async function setCab(v){
+  clearTimeout(t2);
+  document.getElementById('bc').textContent = v;
+  t2=setTimeout(()=>fetch('/api/bright/cabinet?v='+v,{method:'POST'}),150);
+}
+setInterval(refresh, 800);
+refresh();
+</script>
 
-/* ===================== SETUP / LOOP ===================== */
+</body>
+</html>
+)HTML";
+
+static const char OTA_HTML[] PROGMEM = R"HTML(
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OTA</title>
+<style>
+body{font-family:Arial;margin:18px;background:#111;color:#eee}
+.card{background:#1b1b1b;border:1px solid #333;border-radius:12px;padding:14px;margin:10px 0}
+input,button{padding:10px;border-radius:10px;border:0}
+button{background:#2b2b2b;color:#fff;font-weight:700}
+a{color:#9ef}
+</style>
+</head><body>
+<h2>Web OTA</h2>
+<div class="card">
+<form method="POST" action="/update" enctype="multipart/form-data">
+  <input type="file" name="update">
+  <button type="submit">Upload</button>
+</form>
+</div>
+<div class="card"><a href="/">Back</a></div>
+</body></html>
+)HTML";
+
+// ======================= SETUP / LOOP =======================
 
 void setup() {
-  pinMode(PIN_ONBOARD_LED, OUTPUT);
-  digitalWrite(PIN_ONBOARD_LED, HIGH);
+  Serial.begin(115200);
 
-  FastLED.addLeds<WS2812B, PIN_TOWER, GRB>(towerLeds, NUM_TOWER);
-  FastLED.addLeds<WS2812B, PIN_CAB, GRB>(cabLeds, NUM_CAB);
-  FastLED.setBrightness(255);
-  render();
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  pinMode(PIN_KEY_AUTO, INPUT_PULLUP);
+  pinMode(PIN_KEY_MANUAL, INPUT_PULLUP);
+
+  ampel.begin();
+  cabinet.begin();
+
+  setCabinet(brightCabinet);
+  setAmpel(state);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
+  delay(100);
 
-  server.on("/", handleRoot);
-  server.on("/ota", handleOTA);
+  server.on("/", HTTP_GET, [](){ server.send(200, "text/html", INDEX_HTML); });
+  server.on("/ota", HTTP_GET, [](){ server.send(200, "text/html", OTA_HTML); });
 
-  server.on("/start", handleStart);
-  server.on("/stop", handleStop);
-  server.on("/home", handleHome);
-  server.on("/reset", handleReset);
-  server.on("/fault", handleFault);
+  server.on("/api/state", HTTP_GET, sendJson);
 
-  server.on("/tower", handleTowerBrightness);
-  server.on("/cab", handleCabBrightness);
-  server.on("/cabOn", handleCabOn);
+  server.on("/api/start", HTTP_POST, handleStart);
+  server.on("/api/stop",  HTTP_POST, handleStop);
+  server.on("/api/home",  HTTP_POST, handleHome);
+  server.on("/api/reset", HTTP_POST, handleReset);
+  server.on("/api/fault", HTTP_POST, handleFault);
 
-  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
+  server.on("/api/bright/ampel",   HTTP_POST, handleSetBrightAmpel);
+  server.on("/api/bright/cabinet", HTTP_POST, handleSetBrightCabinet);
+
+  // OTA upload endpoint
+  server.on("/update", HTTP_POST,
+    []() {
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK - Rebooting");
+      delay(200);
+      ESP.restart();
+    },
+    []() {
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (!Update.end(true)) {
+          Update.printError(Serial);
+        }
+      }
+    }
+  );
 
   server.begin();
 }
 
 void loop() {
   server.handleClient();
-  updateOnboardLED();
+
+  // Keyswitch Plausibilitaet
+  if (!keyswitchOk()) {
+    if (state != ST_FAULT) enterFault("Keyswitch invalid (AUTO+MANUAL)");
+  }
+
+  // Schluessel OFF: stoppt RUN/HOME -> WAIT (soft)
+  if (state != ST_FAULT) {
+    if (!keyAuto() && !keyManual()) {
+      if (state == ST_RUN || state == ST_HOME) {
+        state = ST_WAIT;
+        setAmpel(state);
+      }
+    }
+  }
+
+  updateOnboardLed();
 }
+```0
