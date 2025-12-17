@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euxo pipefail
           arduino-cli lib update-index
-          arduino-cli lib install "Adafruit NeoPixel"
+          arduino-cli lib install FastLED
 
       - name: Compile firmware (export binaries)
         run: |
