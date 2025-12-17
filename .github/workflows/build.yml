@@ -13,6 +13,7 @@ jobs:
         run: |
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
           sudo mv bin/arduino-cli /usr/local/bin/
+          arduino-cli version
 
       - name: Install ESP32 core
         run: |
@@ -24,6 +25,7 @@ jobs:
           arduino-cli lib update-index
           arduino-cli lib install "FastLED"
           arduino-cli lib install "Adafruit PWM Servo Driver Library"
+          arduino-cli lib install "Adafruit BusIO"
 
       - name: Compile firmware (export binaries)
         run: |
@@ -34,8 +36,8 @@ jobs:
             --output-dir build \
             firmware/firmware.ino
 
-      - name: Upload firmware BIN
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: firmware-bin
-          path: build/*.bin
+          path: build/
