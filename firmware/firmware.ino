@@ -14,7 +14,11 @@
 #define I2C_SDA     21
 #define I2C_SCL     22
 
-#define ONBOARD_LED 2       // bei vielen ESP32 Devboards GPIO2. Wenn bei dir anders: ändern.
+#define ONBOARD_LED 2       // viele ESP32 Devboards: GPIO2. Falls bei dir anders -> ändern.
+
+// Schlüsselschalter (2 Kontakte gegen GND, active LOW)
+#define KEY_AUTO_PIN    25
+#define KEY_MANUAL_PIN  26
 
 #define PCA_ADDR    0x40
 #define SERVO_FREQ  50
@@ -52,9 +56,12 @@ CLEDController* cabCtl = nullptr;
 /* ---------------- PCA ---------------- */
 Adafruit_PWMServoDriver pca(PCA_ADDR);
 
-/* ---------------- STATE ---------------- */
+/* ---------------- SAFETY / MODE ---------------- */
 enum SafetyState : uint8_t { SAFETY_NORMAL, SAFETY_STOP, SAFETY_FAULT };
-SafetyState safetyState = SAFETY_STOP;  // nach Boot gehen wir auf STOP/rot (konsequent)
+SafetyState safetyState = SAFETY_STOP;  // nach Boot STOP
+
+enum KeyMode : uint8_t { MODE_OFF, MODE_AUTO, MODE_MANUAL };
+KeyMode keyMode = MODE_OFF;
 
 uint8_t ampBrightness = 120; // 0..255
 uint8_t cabBrightness = 80;  // 0..255
@@ -133,7 +140,7 @@ void updateOnboardLED() {
   if (safetyState == SAFETY_FAULT) {
     digitalWrite(ONBOARD_LED, ((millis()/250)%2) ? HIGH : LOW);
   } else {
-    digitalWrite(ONBOARD_LED, HIGH); // immer an, solange ESP läuft
+    digitalWrite(ONBOARD_LED, HIGH); // immer an solange normal/stop (außer fault blink)
   }
 }
 
@@ -160,7 +167,6 @@ void updateLeds() {
 
   updateCabinet();
 
-  // pro-strip Helligkeit sauber getrennt:
   if (ampCtl) ampCtl->setBrightness(255);
   if (cabCtl) cabCtl->setBrightness(255);
 
@@ -168,15 +174,14 @@ void updateLeds() {
   updateOnboardLED();
 }
 
-/* ---------------- SAFETY / STATE RULES ---------------- */
+/* ---------------- SAFETY / RULES ---------------- */
 void setFault() {
   safetyState = SAFETY_FAULT;
-  // sofort Bewegungen stoppen (Targets bleiben, aber wir fahren nicht weiter)
   for (int i=0;i<6;i++) axis[i].moving = false;
 }
 
 void resetFaultToStop() {
-  // deine Vorgabe: Reset endet IMMER in STOP
+  // Vorgabe: Reset endet IMMER in STOP
   if (safetyState == SAFETY_FAULT) {
     safetyState = SAFETY_STOP;
     for (int i=0;i<6;i++) axis[i].moving = false;
@@ -196,20 +201,60 @@ void setNormal() {
   }
 }
 
+/* ---------------- KEY SWITCH ---------------- */
+KeyMode readKeyMode() {
+  // active LOW (Kontakt nach GND)
+  bool autoOn   = (digitalRead(KEY_AUTO_PIN)   == LOW);
+  bool manualOn = (digitalRead(KEY_MANUAL_PIN) == LOW);
+
+  if (autoOn && !manualOn)   return MODE_AUTO;
+  if (manualOn && !autoOn)   return MODE_MANUAL;
+
+  // beide oder keiner: als OFF behandeln (sicher)
+  return MODE_OFF;
+}
+
+const char* keyModeName(KeyMode m) {
+  switch(m) {
+    case MODE_OFF: return "OFF";
+    case MODE_AUTO: return "AUTO";
+    case MODE_MANUAL: return "MANUAL";
+    default: return "?";
+  }
+}
+
+void enforceKeyMode() {
+  KeyMode newMode = readKeyMode();
+  if (newMode != keyMode) {
+    keyMode = newMode;
+
+    // OFF erzwingt STOP sofort
+    if (keyMode == MODE_OFF) {
+      setStop();
+    }
+  }
+
+  // Wenn OFF: immer STOP halten
+  if (keyMode == MODE_OFF && safetyState != SAFETY_FAULT) {
+    setStop();
+  }
+}
+
 /* ---------------- MOTION ---------------- */
-void setTargetDeg(uint8_t i, int deg) {
+void setTargetDeg(uint8_t i, int deg, bool allowImmediateMove) {
   deg = clampi(deg, servoMinDeg[i], servoMaxDeg[i]);
   axis[i].tgtDeg = (float)deg;
 
-  // wenn wir normal sind: Bewegung freigeben
-  // wenn STOP: Ziel setzen ja, aber bewegen erst, wenn wieder NORMAL (Start/Home)
-  if (safetyState == SAFETY_NORMAL) {
+  if (safetyState == SAFETY_NORMAL && allowImmediateMove) {
     axis[i].moving = (fabs(axis[i].tgtDeg - axis[i].curDeg) >= 0.5f);
   }
 }
 
 void startMoveToTargets() {
-  // Start: wechselt STOP->NORMAL, und fährt alle Achsen, die nicht am Ziel sind.
+  // Start: nur wenn nicht OFF und nicht FAULT
+  if (keyMode == MODE_OFF) return;
+  if (safetyState == SAFETY_FAULT) return;
+
   setNormal();
   for (int i=0;i<6;i++) {
     axis[i].moving = (fabs(axis[i].tgtDeg - axis[i].curDeg) >= 0.5f);
@@ -217,8 +262,10 @@ void startMoveToTargets() {
 }
 
 void commandHome() {
+  if (keyMode == MODE_OFF) return;
   if (safetyState == SAFETY_FAULT) return;
-  setNormal(); // Home darf fahren => normal
+
+  setNormal();
   for (int i=0;i<6;i++) {
     axis[i].tgtDeg = (float)clampi(servoHomeDeg[i], servoMinDeg[i], servoMaxDeg[i]);
     axis[i].moving = (fabs(axis[i].tgtDeg - axis[i].curDeg) >= 0.5f);
@@ -226,8 +273,8 @@ void commandHome() {
 }
 
 void servoMotionLoop() {
-  if (safetyState == SAFETY_FAULT) return;  // nix bewegen
-  if (safetyState == SAFETY_STOP) return;   // nix bewegen
+  if (safetyState == SAFETY_FAULT) return;
+  if (safetyState == SAFETY_STOP)  return;
 
   const uint32_t now = millis();
   if (now - lastServoUpdate < SERVO_UPDATE_MS) return;
@@ -249,7 +296,6 @@ void servoMotionLoop() {
       cur += (diff > 0 ? maxStep : -maxStep);
     }
 
-    // clamp final
     cur = (float)clampi((int)round(cur), servoMinDeg[i], servoMaxDeg[i]);
     axis[i].curDeg = cur;
 
@@ -261,7 +307,6 @@ void servoMotionLoop() {
 String stateString() {
   if (safetyState == SAFETY_FAULT) return "FAULT";
   if (safetyState == SAFETY_STOP)  return "STOP";
-  // normal:
   if (anyAxisMoving()) return "RUN";
   if (atHome()) return "HOME";
   return "WAIT";
@@ -287,12 +332,16 @@ String htmlPage() {
   "<h2>RobotCtrl</h2>"
 
   "<div class='card'>"
+  "<div><b>Mode:</b> <span id='km'>...</span></div>"
   "<div><b>Status:</b> <span id='st'>...</span></div>"
   "<button class='g' onclick=\"cmd('start')\">Start</button>"
   "<button class='r' onclick=\"cmd('stop')\">Stop</button>"
   "<button class='b' onclick=\"cmd('home')\">Home</button>"
   "<button class='r' onclick=\"cmd('fault')\">FAULT</button>"
   "<button class='b' onclick=\"cmd('reset')\">Reset/Quit</button>"
+  "<div style='margin-top:10px;color:#bbb;font-size:13px'>"
+  "OFF erzwingt STOP. AUTO: Slider setzen Targets (fahren bei Start/Home). MANUAL: Slider fährt sofort (wenn nicht STOP/FAULT)."
+  "</div>"
   "</div>"
 
   "<div class='card'>"
@@ -304,7 +353,7 @@ String htmlPage() {
   "</div>"
 
   "<div class='card'>"
-  "<h3>Servos (Targets)</h3>"
+  "<h3>Servos</h3>"
   "<div id='servos'></div>"
   "<button class='w' onclick=\"cmd('apply')\">Apply / fahren (Start)</button>"
   "<button class='b' onclick=\"cmd('home')\">HOME Position fahren</button>"
@@ -338,6 +387,7 @@ String htmlPage() {
   "function setServo(i,v){qs('#sv'+i).innerText=v; fetch(`/servo?i=${i}&deg=${v}`);}"
   "function poll(){fetch('/status').then(r=>r.json()).then(j=>{"
   "  qs('#st').innerText=j.state;"
+  "  qs('#km').innerText=j.keymode;"
   "  qs('#ab').value=j.ampB; qs('#cb').value=j.cabB;"
   "  qs('#abv').innerText=j.ampB; qs('#cbv').innerText=j.cabB;"
   "  for(let i=0;i<6;i++){const e=qs('#sv'+i); if(e) e.innerText=j.tgt[i];}"
@@ -356,6 +406,7 @@ void handleRoot() {
 void handleStatus() {
   String json = "{";
   json += "\"state\":\""; json += stateString(); json += "\",";
+  json += "\"keymode\":\""; json += keyModeName(keyMode); json += "\",";
   json += "\"ampB\":"; json += ampBrightness; json += ",";
   json += "\"cabB\":"; json += cabBrightness; json += ",";
   json += "\"tgt\":[";
@@ -374,13 +425,22 @@ void handleCmd() {
     return;
   }
 
+  // OFF: nur stop/reset erlaubt (fault setzen lassen wir über UI trotzdem zu)
+  if (keyMode == MODE_OFF) {
+    if (c == "stop")  { setStop(); server.send(200,"text/plain","OK"); return; }
+    if (c == "reset") { resetFaultToStop(); server.send(200,"text/plain","OK"); return; }
+    if (c == "fault") { setFault(); server.send(200,"text/plain","OK"); return; }
+    server.send(403,"text/plain","Key switch OFF");
+    return;
+  }
+
   if (c == "fault") { setFault(); server.send(200,"text/plain","OK"); return; }
   if (c == "reset") { resetFaultToStop(); server.send(200,"text/plain","OK"); return; }
 
   if (c == "stop")  { setStop(); server.send(200,"text/plain","OK"); return; }
 
   if (c == "start" || c == "apply") {
-    startMoveToTargets(); // STOP->NORMAL, fährt auf Targets
+    startMoveToTargets();
     server.send(200,"text/plain","OK"); return;
   }
 
@@ -404,11 +464,17 @@ void handleServo() {
   int d = server.arg("deg").toInt();
   if (i < 0 || i > 5) { server.send(400,"text/plain","Bad index"); return; }
 
-  // in FAULT sperren wir alles
   if (safetyState == SAFETY_FAULT) { server.send(403,"text/plain","Reset required"); return; }
+  if (keyMode == MODE_OFF)         { server.send(403,"text/plain","Key switch OFF"); return; }
 
-  // Ziel setzen (bewegt erst bei Start / Home / Normal)
-  setTargetDeg((uint8_t)i, d);
+  // AUTO: Slider setzt nur Target (fahren erst bei Start/Home)
+  // MANUAL: Slider fährt sofort (wenn safety NORMAL), aber nicht aus STOP heraus.
+  bool immediate = (keyMode == MODE_MANUAL);
+
+  // Wenn STOP: keine Sofortfahrt, auch in MANUAL.
+  if (safetyState == SAFETY_STOP) immediate = false;
+
+  setTargetDeg((uint8_t)i, d, immediate);
   server.send(200,"text/plain","OK");
 }
 
@@ -434,6 +500,10 @@ void handleUpdateDone() {
 void setup() {
   pinMode(ONBOARD_LED, OUTPUT);
   digitalWrite(ONBOARD_LED, HIGH);
+
+  pinMode(KEY_AUTO_PIN, INPUT_PULLUP);
+  pinMode(KEY_MANUAL_PIN, INPUT_PULLUP);
+  keyMode = readKeyMode();
 
   // LEDs
   ampCtl = &FastLED.addLeds<WS2812B, AMP_PIN, GRB>(ampLeds, AMP_LEDS);
@@ -469,12 +539,19 @@ void setup() {
 
   server.begin();
 
-  // Startzustand: STOP (rot)
+  // Startzustand: OFF => STOP, sonst STOP
   safetyState = SAFETY_STOP;
 }
 
 void loop() {
   server.handleClient();
+
+  // Schlüsselschalter auswerten + OFF erzwingen
+  enforceKeyMode();
+
+  // Bewegung
   servoMotionLoop();
+
+  // LEDs + Onboard
   updateLeds();
 }
